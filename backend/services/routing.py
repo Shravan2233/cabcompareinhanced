@@ -13,7 +13,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable
 
-from .estimates import parse_metrics
+from .comparison import parse_metrics
 
 USER_AGENT = "CabCompare/1.0 (https://github.com/cabcompare)"
 TRAFFIC_FACTOR = 1.25  # OSRM durations ignore urban congestion; apply city traffic allowance

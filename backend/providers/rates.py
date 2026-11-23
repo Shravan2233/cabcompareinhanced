@@ -1,128 +1,166 @@
-"""Indian city rate cards for clearly labelled route-based INR estimates.
+"""Calibrated Indian city rate-card estimates using OSRM road distance and IST time bands.
 
-Calibrated from government-notified city RTA tariffs (Bengaluru, Delhi, Mumbai,
-Hyderabad, Chennai) and open-source Indian ride-hailing pricing formulas
-(nammayatri/nammayatri, sreeharshitha864/ola-fare-estimator, Mahesh-Chandrasekar/SmartChoice).
-These are transparent route estimates, never live provider quotes.
+These are transparent route estimates (never disguised as live provider API quotes),
+giving riders realistic city tariff ranges when direct provider APIs are unauthenticated.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-# Default/Bengaluru card tuple:
-# (provider, vehicle, ride_type, base_fare, included_km, per_km, per_minute, minimum_fare, rate_multiplier)
-RATE_CARDS = [
-    ("Rapido", "Bike taxi", "bike", 20, 1, 7.5, 0.5, 25, 1.00),
-    ("Rapido", "Auto", "auto", 34, 2, 17.0, 0.3, 35, 1.04),
-    ("Rapido", "Rapido Cab", "sedan", 55, 2, 15.5, 1.2, 75, 0.98),
-    ("Namma Yatri", "Auto", "auto", 36, 2, 18.0, 0.0, 36, 1.00),
-    ("Namma Yatri", "Mini / Sedan", "sedan", 58, 2, 16.0, 1.2, 78, 0.96),
-    ("Namma Yatri", "XL Cab", "premium", 88, 2, 21.0, 1.8, 120, 0.97),
-]
+from .base import now_iso
 
-# City-specific overrides keyed by (provider, ride_type) -> (base, included_km, per_km, per_min, min_fare, multiplier)
-CITY_RATE_OVERRIDES: dict[str, dict[tuple[str, str], tuple[float, float, float, float, float, float]]] = {
-    "bengaluru": {},
-    "mumbai": {
-        ("Rapido", "bike"): (20, 1, 7.0, 0.4, 25, 1.00),
-        ("Rapido", "auto"): (27, 1.5, 18.22, 0.0, 27, 1.03),
-        ("Namma Yatri", "auto"): (27, 1.5, 18.22, 0.0, 27, 1.00),
-        ("Rapido", "sedan"): (38, 1.5, 21.0, 1.1, 60, 0.98),
-        ("Namma Yatri", "sedan"): (40, 1.5, 21.90, 1.1, 65, 0.97),
-        ("Namma Yatri", "premium"): (65, 1.5, 26.0, 1.6, 100, 0.98),
-    },
-    "delhi": {
-        ("Rapido", "bike"): (15, 1, 6.0, 0.4, 20, 1.00),
-        ("Rapido", "auto"): (30, 1.5, 11.0, 0.2, 30, 1.04),
-        ("Namma Yatri", "auto"): (30, 1.5, 11.0, 0.0, 30, 1.00),
-        ("Rapido", "sedan"): (45, 1.5, 14.0, 1.0, 65, 0.98),
-        ("Namma Yatri", "sedan"): (48, 1.5, 14.5, 1.0, 68, 0.96),
-        ("Namma Yatri", "premium"): (75, 1.5, 19.0, 1.5, 110, 0.97),
-    },
-    "hyderabad": {
-        ("Rapido", "bike"): (18, 1, 6.5, 0.4, 22, 1.00),
-        ("Rapido", "auto"): (30, 1.6, 14.0, 0.2, 30, 1.04),
-        ("Namma Yatri", "auto"): (30, 1.6, 14.0, 0.0, 30, 1.00),
-        ("Rapido", "sedan"): (50, 2.0, 14.5, 1.0, 70, 0.98),
-        ("Namma Yatri", "sedan"): (52, 2.0, 15.0, 1.0, 72, 0.96),
-        ("Namma Yatri", "premium"): (80, 2.0, 20.0, 1.5, 115, 0.97),
-    },
-    "chennai": {
-        ("Rapido", "bike"): (18, 1, 6.5, 0.4, 22, 1.00),
-        ("Rapido", "auto"): (30, 1.8, 15.0, 0.2, 30, 1.04),
-        ("Namma Yatri", "auto"): (30, 1.8, 15.0, 0.0, 30, 1.00),
-        ("Rapido", "sedan"): (50, 2.0, 15.0, 1.0, 70, 0.98),
-        ("Namma Yatri", "sedan"): (52, 2.0, 15.5, 1.0, 72, 0.96),
-        ("Namma Yatri", "premium"): (82, 2.0, 20.0, 1.5, 115, 0.97),
-    },
-}
+IST = timezone(timedelta(hours=5, minutes=30))
 
-CITY_BOUNDS: tuple[tuple[str, str, float, float, float, float], ...] = (
+# City bounding boxes: (city_id, display_name, min_lat, max_lat, min_lng, max_lng)
+_CITY_BOXES: tuple[tuple[str, str, float, float, float, float], ...] = (
     ("bengaluru", "Bengaluru", 12.75, 13.25, 77.35, 77.85),
-    ("mumbai", "Mumbai MMR", 18.85, 19.35, 72.70, 73.15),
-    ("delhi", "Delhi NCR", 28.35, 28.90, 76.85, 77.55),
-    ("hyderabad", "Hyderabad", 17.15, 17.65, 78.20, 78.70),
-    ("chennai", "Chennai", 12.85, 13.25, 80.05, 80.35),
+    ("mumbai", "Mumbai", 18.85, 19.35, 72.75, 73.15),
+    ("delhi", "Delhi NCR", 28.35, 28.90, 76.85, 77.45),
+    ("hyderabad", "Hyderabad", 17.20, 17.65, 78.20, 78.70),
+    ("chennai", "Chennai", 12.85, 13.30, 80.05, 80.35),
 )
 
-CITY_NIGHT_RULES: dict[str, tuple[tuple[int, ...], float]] = {
-    "bengaluru": ((22, 23, 0, 1, 2, 3, 4), 1.50),
-    "hyderabad": ((23, 0, 1, 2, 3, 4), 1.50),
-    "delhi": ((23, 0, 1, 2, 3, 4), 1.25),
-    "mumbai": ((0, 1, 2, 3, 4), 1.25),
-    "chennai": ((23, 0, 1, 2, 3, 4), 1.25),
+# (base_fare, base_km, per_km, per_min, min_fare, low_factor, high_factor)
+_DEFAULT_TARIFFS: dict[str, tuple[float, float, float, float, float, float, float]] = {
+    "bike": (20.0, 2.0, 9.0, 0.75, 25.0, 0.90, 1.12),
+    "auto": (30.0, 2.0, 15.0, 1.50, 35.0, 0.92, 1.18),
+    "sedan": (75.0, 4.0, 18.0, 2.00, 85.0, 0.92, 1.18),
+    "premium": (115.0, 4.0, 24.0, 2.50, 130.0, 0.92, 1.20),
 }
 
-# Typical platform fee/aggregator variance when estimating Uber & Ola without live API credentials.
-PROVIDER_MULTIPLIERS = {
-    "Uber": 1.05,
-    "Ola": 1.02,
+_CITY_TARIFF_OVERRIDES: dict[str, dict[str, tuple[float, float, float, float, float, float, float]]] = {
+    "bengaluru": {
+        # Matches Bengaluru BTP Auto (₹30 for 2km + ₹15/km) and Karnataka aggregator cab slabs
+        "bike": (20.0, 2.0, 9.0, 0.75, 25.0, 0.90, 1.14),
+        "auto": (30.0, 2.0, 15.0, 1.65, 35.0, 0.94, 1.22),
+        "sedan": (75.0, 4.0, 18.5, 2.10, 89.0, 0.92, 1.19),
+        "premium": (115.0, 4.0, 24.5, 2.60, 135.0, 0.92, 1.22),
+    },
+    "mumbai": {
+        "bike": (20.0, 1.5, 8.5, 0.75, 25.0, 0.90, 1.14),
+        "auto": (26.0, 1.5, 17.14, 1.60, 26.0, 0.94, 1.18),
+        "sedan": (70.0, 3.0, 19.5, 2.20, 85.0, 0.92, 1.20),
+        "premium": (110.0, 3.0, 26.0, 2.80, 130.0, 0.92, 1.22),
+    },
+    "delhi": {
+        "bike": (18.0, 2.0, 7.5, 0.65, 22.0, 0.90, 1.12),
+        "auto": (30.0, 1.5, 11.0, 1.20, 30.0, 0.93, 1.18),
+        "sedan": (65.0, 3.0, 16.0, 1.80, 75.0, 0.92, 1.18),
+        "premium": (105.0, 3.0, 22.0, 2.40, 120.0, 0.92, 1.20),
+    },
+    "hyderabad": {
+        "bike": (18.0, 2.0, 8.0, 0.65, 22.0, 0.90, 1.12),
+        "auto": (28.0, 1.6, 13.0, 1.30, 30.0, 0.92, 1.18),
+        "sedan": (70.0, 4.0, 17.0, 1.90, 80.0, 0.92, 1.18),
+        "premium": (110.0, 4.0, 23.0, 2.40, 125.0, 0.92, 1.20),
+    },
+    "chennai": {
+        "bike": (18.0, 2.0, 8.0, 0.70, 24.0, 0.90, 1.14),
+        "auto": (35.0, 1.8, 14.5, 1.40, 35.0, 0.93, 1.20),
+        "sedan": (72.0, 4.0, 17.5, 1.90, 82.0, 0.92, 1.18),
+        "premium": (110.0, 4.0, 23.5, 2.50, 125.0, 0.92, 1.20),
+    },
 }
 
-LOW_FACTOR = 0.90
-HIGH_FACTOR = 1.20
-IST = timezone(timedelta(hours=5, minutes=30))
+_PROVIDER_FACTORS: dict[tuple[str, str], float] = {
+    ("Rapido", "bike"): 0.94,
+    ("Uber", "bike"): 1.00,
+    ("Ola", "bike"): 1.04,
+    ("Namma Yatri", "auto"): 0.97,
+    ("Rapido", "auto"): 1.00,
+    ("Uber", "auto"): 1.04,
+    ("Ola", "auto"): 1.07,
+    ("Rapido", "sedan"): 0.97,
+    ("Namma Yatri", "sedan"): 0.99,
+    ("Uber", "sedan"): 1.05,
+    ("Ola", "sedan"): 1.10,
+    ("Namma Yatri", "premium"): 0.98,
+    ("Uber", "premium"): 1.06,
+    ("Ola", "premium"): 1.12,
+}
 
 
 def detect_city(pickup: dict[str, Any] | None) -> tuple[str, str]:
-    """Return (city_key, display_name) from pickup coordinates, defaulting to Bengaluru/India."""
-    if pickup and pickup.get("lat") is not None and pickup.get("lng") is not None:
-        try:
-            lat, lng = float(pickup["lat"]), float(pickup["lng"])
-            for key, label, min_lat, max_lat, min_lng, max_lng in CITY_BOUNDS:
-                if min_lat <= lat <= max_lat and min_lng <= lng <= max_lng:
-                    return key, label
-        except (TypeError, ValueError):
-            pass
-    return "bengaluru", "Standard India"
+    if not pickup or pickup.get("lat") is None or pickup.get("lng") is None:
+        return "india", "India standard"
+    lat, lng = float(pickup["lat"]), float(pickup["lng"])
+    for city_id, label, min_lat, max_lat, min_lng, max_lng in _CITY_BOXES:
+        if min_lat <= lat <= max_lat and min_lng <= lng <= max_lng:
+            return city_id, label
+    return "india", "India standard"
 
 
-def city_rate_cards(city_key: str) -> list[tuple[str, str, str, float, float, float, float, float, float]]:
-    overrides = CITY_RATE_OVERRIDES.get(city_key, {})
-    cards = []
-    for provider, vehicle, ride_type, base, inc, per_km, per_min, minimum, mult in RATE_CARDS:
-        override = overrides.get((provider, ride_type))
-        if override:
-            b, i, k, m, mn, ml = override
-            cards.append((provider, vehicle, ride_type, b, i, k, m, mn, ml))
-        else:
-            cards.append((provider, vehicle, ride_type, base, inc, per_km, per_min, minimum, mult))
-    return cards
+def time_factor_and_label(now: datetime | None = None) -> tuple[float, str]:
+    current = (now or datetime.now(timezone.utc)).astimezone(IST)
+    minutes = current.hour * 60 + current.minute
+    if 8 * 60 <= minutes < 11 * 60:
+        return 1.12, "morning peak"
+    if 17 * 60 + 30 <= minutes < 21 * 60 + 30:
+        return 1.15, "evening peak"
+    if minutes >= 23 * 60 or minutes < 5 * 60:
+        return 1.25, "night tariff"
+    return 1.00, "standard hours"
 
 
-def time_factor(city_key: str, provider: str, ride_type: str, now_ist: datetime | None = None) -> tuple[float, str]:
-    """Return (multiplier, period_label) based on IST time-of-day and city RTA night rules."""
-    current = now_ist or datetime.now(timezone.utc).astimezone(IST)
-    hour = current.hour
-    night_hours, auto_night_mult = CITY_NIGHT_RULES.get(city_key, ((23, 0, 1, 2, 3, 4), 1.25))
-    if hour in night_hours:
-        # Metered autos follow RTA night multipliers; app cabs/bikes carry lighter night demand.
-        mult = auto_night_mult if ride_type == "auto" else 1.15
-        return mult, "night tariff"
-    if hour in (8, 9, 10, 17, 18, 19, 20):
-        # Zero-commission Namma Yatri autos adhere more closely to metered RTA slabs in peak hours.
-        if provider == "Namma Yatri" and ride_type == "auto":
-            return 1.00, "peak hours (RTA base)"
-        return 1.12, "peak-hour demand"
-    return 1.00, "off-peak"
+def estimate_option_fare(
+    option: dict[str, Any],
+    metrics: dict[str, float],
+    pickup: dict[str, Any] | None = None,
+    *,
+    now: datetime | None = None,
+    retrieved_at: str | None = None,
+) -> dict[str, Any]:
+    """Compute a calibrated rate-card estimate range for one ride option."""
+    city_id, city_label = detect_city(pickup)
+    ride_type = option["ride_type"]
+    provider = option["provider"]
+
+    tariffs = _CITY_TARIFF_OVERRIDES.get(city_id, _DEFAULT_TARIFFS)
+    base, base_km, per_km, per_min, min_fare, low_factor, high_factor = tariffs.get(
+        ride_type,
+        _DEFAULT_TARIFFS["sedan"],
+    )
+
+    distance_km = float(metrics["distance_km"])
+    duration_min = float(metrics["duration_minutes"])
+    extra_km = max(0.0, distance_km - base_km)
+    raw = max(min_fare, base + extra_km * per_km + duration_min * per_min)
+
+    t_factor, time_label = time_factor_and_label(now)
+    p_factor = _PROVIDER_FACTORS.get((provider, ride_type), 1.0)
+    mid = round(raw * t_factor * p_factor)
+    low = max(round(min_fare * 0.9), round(mid * low_factor))
+    high = max(low + 5, round(mid * high_factor))
+    mid = round((low + high) / 2)
+
+    timestamp = retrieved_at or now_iso()
+    note = (
+        f"{city_label} {time_label} rate-card estimate "
+        f"({distance_km:g} km road route, ~{round(duration_min)} min). "
+        f"Confirm live surge and promos in {provider}."
+    )
+    return {
+        "id": option["id"],
+        "provider": provider,
+        "vehicleType": option["product_name"],
+        "product_name": option["product_name"],
+        "ride_type": ride_type,
+        "fare": float(mid),
+        "fareRange": {"min": float(low), "max": float(high)},
+        "fare_low": float(low),
+        "fare_high": float(high),
+        "currency": "INR",
+        "etaMinutes": None,
+        "pickup_eta_minutes": None,
+        "trip_duration_minutes": round(duration_min),
+        "distance_km": round(distance_km, 1),
+        "quoteType": "FARE_ESTIMATE",
+        "quoteSource": "rate_card",
+        "retrievedAt": timestamp,
+        "status": "success",
+        "error": None,
+        "fare_status": "estimated",
+        "availability_status": "available",
+        "fare_disclaimer": note,
+    }

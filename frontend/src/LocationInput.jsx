@@ -11,6 +11,7 @@ export default function LocationInput({
   const [active, setActive] = useState(-1)
   const [busy, setBusy] = useState(false)
   const [searched, setSearched] = useState(false)
+  const [searchError, setSearchError] = useState('')
   const token = useRef(null)
   const wrapper = useRef(null)
   const text = value.text || ''
@@ -22,10 +23,12 @@ export default function LocationInput({
       setItems([])
       setBusy(false)
       setSearched(false)
+      setSearchError('')
       return undefined
     }
     let cancelled = false
     setBusy(true)
+    setSearchError('')
     const timer = setTimeout(async () => {
       try {
         if (mapsEnabled) token.current = token.current || (await newSessionToken())
@@ -35,11 +38,13 @@ export default function LocationInput({
           setItems(found.slice(0, 6))
           setActive(-1)
           setSearched(true)
+          setSearchError('')
         }
-      } catch {
+      } catch (err) {
         if (!cancelled) {
           setItems([])
           setSearched(true)
+          setSearchError(err?.message || 'Unable to reach location search.')
         }
       } finally {
         if (!cancelled) setBusy(false)
@@ -96,7 +101,7 @@ export default function LocationInput({
         </button>
       )}
       {children}
-      {open && (items.length > 0 || busy || searched) && (
+      {open && (items.length > 0 || busy || searched || searchError) && (
         <ul className="suggestions" id={listId} role="listbox">
           {items.map((item, index) => (
             <li
@@ -111,7 +116,8 @@ export default function LocationInput({
             </li>
           ))}
           {busy && !items.length && <li className="suggestions-note">Searching places…</li>}
-          {!busy && searched && !items.length && (
+          {!busy && searchError && <li className="suggestions-note suggestions-error">{searchError}</li>}
+          {!busy && !searchError && searched && !items.length && (
             <li className="suggestions-note">No suggestions yet — keep typing or enter full area/city</li>
           )}
           {items.length > 0 && (

@@ -6,9 +6,9 @@ from flask import Flask, jsonify, request
 
 from .providers import PROVIDERS
 from .providers.links import booking_for
-from .services.comparison import InvalidRoute, compare_rides, validate_route
-from .services.estimates import parse_metrics
+from .services.comparison import InvalidRoute, compare_rides, parse_metrics, validate_route
 from .services.fares import comparison_rides
+from .services.guards import SlidingWindowLimiter
 from .services.routing import osm_route_metrics, reverse_geocode, suggest_places
 
 load_dotenv()
@@ -35,12 +35,22 @@ def _optional_near_coords():
     return parse_coords({"lat": lat, "lng": lng})
 
 
+def _client_key() -> str:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return forwarded or request.remote_addr or "local"
+
+
 _LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
 
 
 def create_app():
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+    compare_limit = int(os.getenv("RATE_LIMIT_COMPARE_PER_MIN", "30"))
+    places_limit = int(os.getenv("RATE_LIMIT_PLACES_PER_MIN", "90"))
+    compare_limiter = SlidingWindowLimiter(max_requests=compare_limit, window_seconds=60.0)
+    places_limiter = SlidingWindowLimiter(max_requests=places_limit, window_seconds=60.0)
+
     frontend_origins = {
         origin.strip()
         for origin in os.getenv(
@@ -51,14 +61,29 @@ def create_app():
     }
 
     @app.after_request
-    def add_cors_headers(response):
+    def add_security_and_cors_headers(response):
         origin = request.headers.get("Origin")
         if origin and (origin in frontend_origins or _LOCAL_ORIGIN_RE.fullmatch(origin)):
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Vary"] = "Origin"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type"
             response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response
+
+    def _enforce_rate_limit(limiter: SlidingWindowLimiter):
+        if limiter.max_requests <= 0:
+            return None
+        allowed, retry_after = limiter.allow(_client_key())
+        if not allowed:
+            resp = jsonify({
+                "error": f"Too many requests. Try again in {retry_after} seconds.",
+                "retry_after_seconds": retry_after,
+            })
+            resp.status_code = 429
+            resp.headers["Retry-After"] = str(retry_after)
+            return resp
+        return None
 
     @app.get("/api/health")
     def health():
@@ -70,6 +95,8 @@ def create_app():
 
     @app.get("/api/places/suggest")
     def place_suggestions():
+        if limited := _enforce_rate_limit(places_limiter):
+            return limited
         query = (request.args.get("q") or "").strip()
         if len(query) < 2 or len(query) > 160:
             return jsonify({"suggestions": [], "source": "openstreetmap"})
@@ -84,6 +111,8 @@ def create_app():
 
     @app.get("/api/places/reverse")
     def place_reverse():
+        if limited := _enforce_rate_limit(places_limiter):
+            return limited
         try:
             coords = parse_coords({"lat": request.args.get("lat"), "lng": request.args.get("lng")})
         except ValueError as error:
@@ -107,6 +136,8 @@ def create_app():
 
     @app.post("/api/rides/compare")
     def compare():
+        if limited := _enforce_rate_limit(compare_limiter):
+            return limited
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             return jsonify({"error": "Send pickup and destination as JSON."}), 400
@@ -151,10 +182,9 @@ def create_app():
             ride["booking"] = booking
             ride["booking_url"] = booking["url"] if booking else None
         result["notice"] = (
-            "Uber and Ola use provider API estimates when available; otherwise they show "
-            "route-based rate-card estimates. Model predictions use historical labeled fares. "
-            "Availability is not guaranteed, and demand, surge, traffic, tolls, or provider "
-            "pricing may change the fare. Confirm in the provider app."
+            "Prices combine live provider API/ONDC quotes when configured with calibrated "
+            "Indian city rate-card estimates using OpenStreetMap road distance and traffic duration. "
+            "Confirm final surge and promos inside the provider app before booking."
         )
         result["route_metrics"] = metrics
         result["route_geometry"] = route_geometry

@@ -1,15 +1,33 @@
+"""Route validation, metric sanitization, and genuine quote comparison engine."""
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
 
-
 CATEGORIES = {"bike", "auto", "sedan", "premium"}
 SORT_OPTIONS = {"cheapest", "pickup", "best_value"}
+GENUINE_QUOTE_TYPES = {"LIVE_QUOTE", "FARE_ESTIMATE"}
+GENUINE_STATUSES = {"live", "estimated"}
+MAX_KM = 500
+MAX_MINUTES = 24 * 60
 
 
 class InvalidRoute(ValueError):
     pass
+
+
+def parse_metrics(value: Any) -> dict[str, float] | None:
+    """Validate {'distance_km','duration_minutes'} from a client value, or None if absent."""
+    if value is None:
+        return None
+    try:
+        km = float(value["distance_km"])
+        minutes = float(value["duration_minutes"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("Route metrics must include distance_km and duration_minutes.")
+    if not (0 < km <= MAX_KM) or not (0 < minutes <= MAX_MINUTES):
+        raise ValueError("Route distance or duration is out of range.")
+    return {"distance_km": round(km, 1), "duration_minutes": round(minutes)}
 
 
 def validate_route(pickup: Any, destination: Any) -> tuple[str, str]:
@@ -24,6 +42,21 @@ def validate_route(pickup: Any, destination: Any) -> tuple[str, str]:
     if pickup.casefold() == destination.casefold():
         raise InvalidRoute("Pickup and destination must be different.")
     return pickup, destination
+
+
+def _is_comparable_quote(ride: dict[str, Any]) -> bool:
+    quote_type = ride.get("quoteType")
+    if quote_type is not None and quote_type not in GENUINE_QUOTE_TYPES:
+        return False
+    fare = ride.get("fare")
+    return (
+        ride.get("availability_status") == "available"
+        and isinstance(fare, (int, float))
+        and not isinstance(fare, bool)
+        and fare >= 0
+        and bool(ride.get("currency"))
+        and ride.get("fare_status") in GENUINE_STATUSES
+    )
 
 
 def compare_rides(
@@ -50,14 +83,7 @@ def compare_rides(
             unique.setdefault(key, dict(ride))
 
     results = list(unique.values())
-    comparable = [
-        ride for ride in results
-        if ride.get("availability_status") == "available"
-        and isinstance(ride.get("fare"), (int, float))
-        and ride["fare"] >= 0
-        and ride.get("currency")
-        and ride.get("fare_status") in {"live", "model", "estimated"}
-    ]
+    comparable = [ride for ride in results if _is_comparable_quote(ride)]
     lowest_ids = set()
     bases = {(ride["currency"], ride["fare_status"]) for ride in comparable}
     for currency, status in bases:
@@ -77,7 +103,12 @@ def compare_rides(
             )
         )
     elif sort == "pickup":
-        results.sort(key=lambda ride: (ride.get("pickup_eta_minutes") is None, ride.get("pickup_eta_minutes") or float("inf")))
+        results.sort(
+            key=lambda ride: (
+                ride.get("pickup_eta_minutes") is None,
+                ride.get("pickup_eta_minutes") if ride.get("pickup_eta_minutes") is not None else float("inf"),
+            )
+        )
     else:
         results.sort(
             key=lambda ride: (
@@ -90,11 +121,29 @@ def compare_rides(
     for ride in results:
         ride["is_lowest"] = ride.get("id") in lowest_ids
 
-    sources = {ride.get("fare_status") for ride in results if ride.get("fare_status") != "unavailable"}
+    sources = {ride.get("fare_status") for ride in results if _is_comparable_quote(ride)}
     fare_source = next(iter(sources)) if len(sources) == 1 else "mixed" if sources else "unavailable"
+
+    cheapest_quote = None
+    if comparable:
+        cheapest = min(comparable, key=lambda ride: ride["fare"])
+        cheapest_quote = {
+            "id": cheapest.get("id"),
+            "provider": cheapest.get("provider"),
+            "vehicleType": cheapest.get("vehicleType") or cheapest.get("product_name"),
+            "fare": cheapest.get("fare"),
+            "fareRange": cheapest.get("fareRange"),
+            "currency": cheapest.get("currency"),
+            "quoteType": cheapest.get("quoteType") or (
+                "LIVE_QUOTE" if cheapest.get("fare_status") == "live" else "FARE_ESTIMATE"
+            ),
+            "quoteSource": cheapest.get("quoteSource"),
+        }
+
     return {
         "route": {"pickup": pickup, "destination": destination},
         "rides": results,
+        "cheapest_quote": cheapest_quote,
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "fare_source": fare_source,
     }

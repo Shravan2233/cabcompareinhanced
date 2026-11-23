@@ -42,7 +42,10 @@ export async function suggestPlaces(input, sessionToken, near = null) {
       params.set('lng', String(near.lng))
     }
     const response = await fetch(`${API_BASE}/api/places/suggest?${params.toString()}`)
-    if (!response.ok) return []
+    if (!response.ok) {
+      const payload = await response.json().catch(() => ({}))
+      throw new Error(payload.error || 'Place search is offline. Ensure the backend API is running on port 5000.')
+    }
     const data = await response.json()
     return Array.isArray(data.suggestions) ? data.suggestions : []
   }

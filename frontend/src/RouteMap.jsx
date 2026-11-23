@@ -1,27 +1,12 @@
-import { useEffect, useRef, useState } from 'react'
-import { AttributionControl, LngLatBounds, Map as MapLibreMap, Marker, NavigationControl, Popup } from 'maplibre-gl'
-import 'maplibre-gl/dist/maplibre-gl.css'
-import { LocateFixed, MapPin, Pencil } from 'lucide-react'
-
-const OPENFREEMAP_STYLE = 'https://tiles.openfreemap.org/styles/positron'
-
-function makePinElement(kind) {
-  const el = document.createElement('div')
-  el.className = `map-pin ${kind}`
-  return el
-}
-
-function routeBounds(points) {
-  const bounds = new LngLatBounds()
-  for (const [lng, lat] of points) bounds.extend([lng, lat])
-  return bounds
-}
+import { useEffect, useRef } from 'react'
+import L from 'leaflet'
+import { LocateFixed, Pencil } from 'lucide-react'
+import { addFreeTileLayer, createPinIcon } from './leafletTiles.js'
 
 export default function RouteMap({ route, routeCoords, routeGeometry, metrics, onAdjustPins = null }) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const boundsRef = useRef(null)
-  const [mapError, setMapError] = useState(false)
 
   const pickup = routeCoords?.pickup
   const destination = routeCoords?.destination
@@ -29,78 +14,41 @@ export default function RouteMap({ route, routeCoords, routeGeometry, metrics, o
 
   useEffect(() => {
     if (!hasPins || !containerRef.current) return undefined
-    setMapError(false)
 
-    const lineCoords = Array.isArray(routeGeometry) && routeGeometry.length >= 2
-      ? routeGeometry
-      : [[pickup.lng, pickup.lat], [destination.lng, destination.lat]]
+    const latLngLine = Array.isArray(routeGeometry) && routeGeometry.length >= 2
+      ? routeGeometry.map(([lng, lat]) => [lat, lng])
+      : [[pickup.lat, pickup.lng], [destination.lat, destination.lng]]
 
-    const bounds = routeBounds([...lineCoords, [pickup.lng, pickup.lat], [destination.lng, destination.lat]])
+    const bounds = L.latLngBounds([...latLngLine, [pickup.lat, pickup.lng], [destination.lat, destination.lng]])
     boundsRef.current = bounds
 
-    let map
-    try {
-      map = new MapLibreMap({
-        container: containerRef.current,
-        style: OPENFREEMAP_STYLE,
-        bounds,
-        fitBoundsOptions: { padding: 48, maxZoom: 15 },
-        attributionControl: false,
-      })
-    } catch {
-      setMapError(true)
-      return undefined
-    }
-
+    const map = L.map(containerRef.current, {
+      zoomControl: true,
+      attributionControl: true,
+    })
     mapRef.current = map
-    map.addControl(new NavigationControl({ showCompass: false }), 'top-right')
-    map.addControl(new AttributionControl({ compact: true }), 'bottom-right')
+    addFreeTileLayer(map)
 
-    map.on('error', () => {
-      // Only fall back if the base map itself failed to initialize a source
-      if (!map.isStyleLoaded()) setMapError(true)
-    })
+    // Subtle white casing underneath the green route line for crisp street contrast.
+    L.polyline(latLngLine, { color: '#ffffff', weight: 7, opacity: 0.9, lineCap: 'round', lineJoin: 'round' }).addTo(map)
+    L.polyline(latLngLine, { color: '#087e68', weight: 4, opacity: 0.95, lineCap: 'round', lineJoin: 'round' }).addTo(map)
 
-    map.on('load', () => {
-      if (!map.getSource('cabcompare-route')) {
-        map.addSource('cabcompare-route', {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            properties: {},
-            geometry: { type: 'LineString', coordinates: lineCoords },
-          },
-        })
-        map.addLayer({
-          id: 'cabcompare-route-casing',
-          type: 'line',
-          source: 'cabcompare-route',
-          layout: { 'line-join': 'round', 'line-cap': 'round' },
-          paint: { 'line-color': '#ffffff', 'line-width': 7, 'line-opacity': 0.9 },
-        })
-        map.addLayer({
-          id: 'cabcompare-route-line',
-          type: 'line',
-          source: 'cabcompare-route',
-          layout: { 'line-join': 'round', 'line-cap': 'round' },
-          paint: { 'line-color': '#087e68', 'line-width': 4, 'line-opacity': 0.95 },
-        })
-      }
+    L.marker([pickup.lat, pickup.lng], { icon: createPinIcon('pickup') })
+      .bindPopup(`Pickup: ${route?.pickup?.text || 'Start'}`)
+      .addTo(map)
 
-      new Marker({ element: makePinElement('pickup') })
-        .setLngLat([pickup.lng, pickup.lat])
-        .setPopup(new Popup({ offset: 14 }).setText(`Pickup: ${route?.pickup?.text || 'Start'}`))
-        .addTo(map)
+    L.marker([destination.lat, destination.lng], { icon: createPinIcon('destination') })
+      .bindPopup(`Drop: ${route?.destination?.text || 'Destination'}`)
+      .addTo(map)
 
-      new Marker({ element: makePinElement('destination') })
-        .setLngLat([destination.lng, destination.lat])
-        .setPopup(new Popup({ offset: 14 }).setText(`Drop: ${route?.destination?.text || 'Destination'}`))
-        .addTo(map)
-
-      map.fitBounds(bounds, { padding: 48, maxZoom: 15, duration: 0 })
-    })
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
+    const resizeTimer = setTimeout(() => {
+      map.invalidateSize()
+      map.fitBounds(bounds, { padding: [40, 40], maxZoom: 15 })
+    }, 80)
 
     return () => {
+      clearTimeout(resizeTimer)
       mapRef.current = null
       map.remove()
     }
@@ -110,19 +58,7 @@ export default function RouteMap({ route, routeCoords, routeGeometry, metrics, o
 
   return (
     <div className="route-map-card">
-      {mapError ? (
-        <div className="route-map-fallback">
-          <MapPin size={18} />
-          <div>
-            <strong>Route map preview unavailable</strong>
-            <span>
-              {pickup.lat.toFixed(4)}, {pickup.lng.toFixed(4)} to {destination.lat.toFixed(4)}, {destination.lng.toFixed(4)}
-            </span>
-          </div>
-        </div>
-      ) : (
-        <div className="route-map-canvas" ref={containerRef} aria-label="Interactive route map" />
-      )}
+      <div className="route-map-canvas" ref={containerRef} aria-label="Interactive route map" />
       <div className="route-map-bar">
         <div className="route-map-stats">
           <span className="legend-dot pickup" />
@@ -142,15 +78,13 @@ export default function RouteMap({ route, routeCoords, routeGeometry, metrics, o
               <Pencil size={12} /> Adjust pins
             </button>
           )}
-          {!mapError && (
-            <button
-              type="button"
-              className="recenter-button"
-              onClick={() => boundsRef.current && mapRef.current?.fitBounds(boundsRef.current, { padding: 48, maxZoom: 15 })}
-            >
-              <LocateFixed size={13} /> Center
-            </button>
-          )}
+          <button
+            type="button"
+            className="recenter-button"
+            onClick={() => boundsRef.current && mapRef.current?.fitBounds(boundsRef.current, { padding: [40, 40], maxZoom: 15 })}
+          >
+            <LocateFixed size={13} /> Center
+          </button>
         </div>
       </div>
     </div>
