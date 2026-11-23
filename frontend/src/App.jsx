@@ -2,13 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import axios from 'axios'
 import {
   ArrowDownUp, ArrowRight, Bike, CarFront, Check, ChevronDown, Clock3,
-  Crosshair, ExternalLink, MapPin, Navigation, RefreshCw, ShieldCheck, Sparkles,
+  Copy, Crosshair, ExternalLink, Map, MapPin, Navigation, RefreshCw, ShieldCheck, Sparkles,
   TrainFront, TriangleAlert, Zap,
 } from 'lucide-react'
 import LocationInput from './LocationInput.jsx'
-import { mapsEnabled, reverseGeocode, routeMetrics } from './maps.js'
+import MapPickerModal from './MapPickerModal.jsx'
+import RouteMap from './RouteMap.jsx'
+import { API_BASE, mapsEnabled, reverseGeocode, routeMetrics } from './maps.js'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000'
 const ROUTES = [
   ['Indiranagar, Bengaluru', 'MG Road, Bengaluru'],
   ['Bandra, Mumbai', 'Lower Parel, Mumbai'],
@@ -28,7 +29,7 @@ const SORTS = [
 ]
 
 const place = (text) => ({ text })
-const hasCoords = (p) => p.lat != null && p.lng != null
+const hasCoords = (p) => p?.lat != null && p?.lng != null
 const asPlace = (p) => (typeof p === 'string' ? place(p) : p)
 const normalizeRoute = (r) => ({ pickup: asPlace(r.pickup), destination: asPlace(r.destination) })
 const formatFare = (value) => new Intl.NumberFormat(undefined, { maximumFractionDigits: 2 }).format(value)
@@ -65,14 +66,47 @@ function App() {
   const [error, setError] = useState('')
   const [updatedAt, setUpdatedAt] = useState('')
   const [metrics, setMetrics] = useState(null)
+  const [routeCoords, setRouteCoords] = useState(null)
+  const [routeGeometry, setRouteGeometry] = useState(null)
   const [notice, setNotice] = useState('')
+  const [copiedId, setCopiedId] = useState('')
+  const [mapPicker, setMapPicker] = useState({ open: false, target: 'pickup' })
+  const pickupEditedRef = useRef(false)
   const destinationRef = useRef(null)
   const resultsRef = useRef(null)
   const [recent, setRecent] = useState(() => {
     try { return JSON.parse(localStorage.getItem('cabcompare-recent') || '[]').map(normalizeRoute) } catch { return [] }
   })
 
+  // Auto-populate current location in source field on initial open when browser permits.
+  useEffect(() => {
+    if (!navigator.geolocation || !window.isSecureContext) return undefined
+    let cancelled = false
+    setLocating(true)
+    navigator.geolocation.getCurrentPosition(
+      async ({ coords }) => {
+        if (cancelled || pickupEditedRef.current) {
+          setLocating(false)
+          return
+        }
+        const { latitude: lat, longitude: lng } = coords
+        let text = `Current location (${lat.toFixed(4)}, ${lng.toFixed(4)})`
+        try { text = await reverseGeocode(lat, lng) } catch { /* keep coordinates as label */ }
+        if (!cancelled && !pickupEditedRef.current) {
+          setPickup({ text, lat, lng })
+        }
+        if (!cancelled) setLocating(false)
+      },
+      () => {
+        if (!cancelled) setLocating(false)
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 },
+    )
+    return () => { cancelled = true }
+  }, [])
+
   async function search(nextRoute, nextCategory = category, nextSort = sort, { scroll = false } = {}) {
+    pickupEditedRef.current = true
     setLoading(true)
     setError('')
     try {
@@ -85,16 +119,23 @@ function App() {
         if (gotMetrics) body.route_metrics = gotMetrics
       }
       const response = await axios.post(`${API_BASE}/api/rides/compare`, body)
+      const resolvedCoords = response.data.route_coords || null
+      const syncedPickup = resolvedCoords?.pickup ? { ...nextRoute.pickup, ...resolvedCoords.pickup } : nextRoute.pickup
+      const syncedDestination = resolvedCoords?.destination ? { ...nextRoute.destination, ...resolvedCoords.destination } : nextRoute.destination
+      const syncedRoute = { pickup: syncedPickup, destination: syncedDestination }
+
       setMetrics(response.data.route_metrics || null)
+      setRouteCoords(resolvedCoords)
+      setRouteGeometry(response.data.route_geometry || null)
       setNotice(response.data.notice || 'Live provider fares are unavailable.')
-      setRoute(nextRoute)
-      setPickup(nextRoute.pickup)
-      setDestination(nextRoute.destination)
+      setRoute(syncedRoute)
+      setPickup(syncedPickup)
+      setDestination(syncedDestination)
       setRides(response.data.rides)
       setUpdatedAt(response.data.last_updated)
       setRecent((current) => {
         const same = (a, b) => a.pickup.text === b.pickup.text && a.destination.text === b.destination.text
-        const updated = [nextRoute, ...current.filter((item) => !same(item, nextRoute))].slice(0, 4)
+        const updated = [syncedRoute, ...current.filter((item) => !same(item, syncedRoute))].slice(0, 4)
         try { localStorage.setItem('cabcompare-recent', JSON.stringify(updated)) } catch { /* storage unavailable */ }
         return updated
       })
@@ -121,13 +162,19 @@ function App() {
   }
 
   function swapLocations() {
+    pickupEditedRef.current = true
     setPickup(destination)
     setDestination(pickup)
   }
 
   function useCurrentLocation() {
+    pickupEditedRef.current = true
     if (!navigator.geolocation) {
-      setError('Location is not available in this browser. You can enter your pickup manually.')
+      setError('Location is not available in this browser. You can enter your pickup manually or pin it on the map.')
+      return
+    }
+    if (!window.isSecureContext) {
+      setError('GPS auto-detect requires localhost or HTTPS. Type your pickup or use Pin on map below.')
       return
     }
     setError('')
@@ -136,7 +183,7 @@ function App() {
       async ({ coords }) => {
         const { latitude: lat, longitude: lng } = coords
         let text = `Current location (${lat.toFixed(4)}, ${lng.toFixed(4)})`
-        if (mapsEnabled) { try { text = await reverseGeocode(lat, lng) } catch { /* keep coordinates as the label */ } }
+        try { text = await reverseGeocode(lat, lng) } catch { /* keep coordinates as the label */ }
         setPickup({ text, lat, lng })
         setLocating(false)
         destinationRef.current?.focus()
@@ -144,11 +191,57 @@ function App() {
       (failure) => {
         setLocating(false)
         setError(failure.code === 1
-          ? 'Location permission was blocked. Allow it in your browser settings, or type your pickup instead.'
-          : 'We could not find your location. Check GPS/network, or type your pickup instead.')
+          ? 'Location permission was blocked. Allow it in your browser settings, type your pickup, or pin it on the map.'
+          : 'We could not find your location. Type your pickup or pin it on the map instead.')
       },
       { enableHighAccuracy: true, timeout: 12000, maximumAge: 30000 },
     )
+  }
+
+  function applyPinnedRoute(nextPickup, nextDestination, shouldCompare) {
+    pickupEditedRef.current = true
+    const finalPickup = nextPickup?.text ? nextPickup : pickup
+    const finalDest = nextDestination?.text ? nextDestination : destination
+    setPickup(finalPickup)
+    setDestination(finalDest)
+    setMapPicker({ open: false, target: 'pickup' })
+    setError('')
+    if (shouldCompare && finalPickup.text.trim() && finalDest.text.trim()) {
+      search({ pickup: finalPickup, destination: finalDest }, category, sort, { scroll: true })
+    }
+  }
+
+  async function copyRouteForRide(rideId) {
+    if (!route?.pickup?.text || !route?.destination?.text) return
+    const summary = `Pickup: ${route.pickup.text}\nDestination: ${route.destination.text}`
+    let copied = false
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(summary)
+        copied = true
+      }
+    } catch {
+      copied = false
+    }
+    if (!copied) {
+      try {
+        const el = document.createElement('textarea')
+        el.value = summary
+        el.setAttribute('readonly', '')
+        el.style.position = 'fixed'
+        el.style.opacity = '0'
+        document.body.appendChild(el)
+        el.select()
+        copied = document.execCommand('copy')
+        document.body.removeChild(el)
+      } catch {
+        copied = false
+      }
+    }
+    if (copied) {
+      setCopiedId(rideId)
+      setTimeout(() => setCopiedId((current) => (current === rideId ? '' : current)), 2400)
+    }
   }
 
   const formattedTime = updatedAt ? new Date(updatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''
@@ -164,7 +257,7 @@ function App() {
           <a className="nav-active" href="#compare">Compare</a>
           <a href="#how-it-works">How it works</a>
         </nav>
-        <span className="demo-pill"><span /> Hybrid fare estimates</span>
+        <span className="demo-pill"><span /> OpenStreetMap · Rate cards</span>
       </header>
 
       <main id="top">
@@ -182,21 +275,51 @@ function App() {
               <span className="route-icon"><Navigation size={19} /></span>
             </div>
             <div className="location-fields">
-              <LocationInput kicker="FROM" label="Pickup location" dotClass="pickup-dot" value={pickup} placeholder="Pickup location"
-                onTyping={(text) => setPickup(place(text))} onPick={setPickup}>
+              <LocationInput
+                kicker="FROM" label="Pickup location" dotClass="pickup-dot" value={pickup}
+                near={hasCoords(destination) ? destination : null}
+                placeholder={locating ? 'Detecting your location…' : 'Type pickup area or landmark'}
+                onTyping={(text) => { pickupEditedRef.current = true; setPickup(place(text)) }}
+                onPick={(picked) => { pickupEditedRef.current = true; setPickup(picked) }}
+              >
                 <button className="icon-button locate-button" type="button" onClick={useCurrentLocation} disabled={locating} title="Use my current location" aria-label="Use my current location">
                   {locating ? <span className="button-spinner dark" /> : <Crosshair size={17} />}
                 </button>
               </LocationInput>
               <button className="swap-button" type="button" onClick={swapLocations} title="Swap pickup and destination" aria-label="Swap pickup and destination"><ArrowDownUp size={15} /></button>
-              <LocationInput kicker="TO" label="Destination" dotClass="destination-dot" value={destination} placeholder="Where to?" inputRef={destinationRef}
-                onTyping={(text) => setDestination(place(text))} onPick={setDestination} />
+              <LocationInput
+                kicker="TO" label="Destination" dotClass="destination-dot" value={destination}
+                near={hasCoords(pickup) ? pickup : null}
+                placeholder="Type destination area or landmark" inputRef={destinationRef}
+                onTyping={(text) => setDestination(place(text))} onPick={setDestination}
+              />
             </div>
+
+            <div className="pin-bar">
+              <span className="pin-bar-label"><Map size={14} /> Pin on map</span>
+              <div className="pin-bar-actions">
+                <button
+                  type="button"
+                  className={hasCoords(pickup) ? 'pin-chip pinned' : 'pin-chip'}
+                  onClick={() => setMapPicker({ open: true, target: 'pickup' })}
+                >
+                  <span className="legend-dot pickup" /> Pickup
+                </button>
+                <button
+                  type="button"
+                  className={hasCoords(destination) ? 'pin-chip pinned' : 'pin-chip'}
+                  onClick={() => setMapPicker({ open: true, target: 'destination' })}
+                >
+                  <span className="legend-dot destination" /> Destination
+                </button>
+              </div>
+            </div>
+
             <button className="search-button" type="submit" disabled={loading}>
               {loading ? <><span className="button-spinner" /> Comparing rides</> : <>Compare rides <ArrowRight size={17} /></>}
             </button>
             {error && <div className="error-message" role="alert"><TriangleAlert size={16} />{error}</div>}
-            <div className="form-footnote"><span className="privacy-dot" /> {mapsEnabled ? 'Suggestions by Google Maps. ' : 'Type an area or landmark. '}Your route is only used to compare this trip</div>
+            <div className="form-footnote"><span className="privacy-dot" /> {mapsEnabled ? 'Suggestions by Google Maps. ' : 'Free suggestions via OpenStreetMap. '}Enter text or pin locations on the map</div>
           </form>
         </section>
 
@@ -213,13 +336,19 @@ function App() {
                 <RefreshCw size={15} className={loading ? 'spin' : ''} /> Refresh prices
               </button>
             </div>
+            {!loading && route && (
+              <RouteMap
+                route={route} routeCoords={routeCoords} routeGeometry={routeGeometry} metrics={metrics}
+                onAdjustPins={() => setMapPicker({ open: true, target: 'pickup' })}
+              />
+            )}
             <div className="results-toolbar">
               <div className="category-tabs" role="tablist" aria-label="Filter by ride category">
                 {CATEGORIES.map(({ id, label, icon: Icon }) => <button key={id} type="button" role="tab" aria-selected={category === id} className={category === id ? 'category-tab selected' : 'category-tab'} onClick={() => setCategory(id)}><Icon size={16} />{label}</button>)}
               </div>
               <label className="sort-control"><span>Sort by</span><select value={sort} onChange={(event) => setSort(event.target.value)}>{SORTS.map((option) => <option value={option.id} key={option.id}>{option.label}</option>)}</select><ChevronDown size={14} /></label>
             </div>
-            <div className="results-meta"><span>{loading && !route ? 'Loading fare results…' : `${rides.length} options to compare${metrics ? ` · ${metrics.distance_km} km · about ${metrics.duration_minutes} min drive` : ''}`}</span><span className="updated-label"><Clock3 size={13} /> Updated {formattedTime || 'just now'}</span></div>
+            <div className="results-meta"><span className="tabular-figures">{loading && !route ? 'Loading fare results…' : `${rides.length} options to compare${metrics ? ` · ${metrics.distance_km} km · about ${metrics.duration_minutes} min drive` : ''}`}</span><span className="updated-label"><Clock3 size={13} /> Updated {formattedTime || 'just now'}</span></div>
             {loading ? <div className="ride-list" aria-label="Loading ride options">{[1, 2, 3, 4, 5].map((item) => <div className="skeleton-card" key={item}><span /><div><i /><i /></div><i /><span /></div>)}</div> : rides.length ? (
               <div className="ride-list">
                 {rides.map((ride) => <article className={ride.is_lowest ? 'ride-card lowest-card' : 'ride-card'} key={ride.id}>
@@ -229,10 +358,37 @@ function App() {
                     <div className="ride-details"><span>{ride.product_name || ride.ride_type}</span></div>
                     <div className={`fare-source ${ride.fare_status}`}><span className={`fare-tag ${ride.fare_status}`}>{fareLabel(ride)}</span><span>{fareDisclaimer(ride)}</span></div>
                   </div>
-                  <div className="ride-price" aria-label={`${ride.provider} ${fareText(ride)}`}><strong>{fareText(ride)}</strong><span>{ride.fare_status === 'estimated' ? 'Rate-card range · confirm in app' : ride.fare_status === 'model' ? 'Model prediction · confirm in app' : ride.fare_status === 'live' ? 'Provider API estimate · confirm in app' : 'Check fare in the provider app'}</span></div>
+                  <div className="ride-price" aria-label={`${ride.provider} ${fareText(ride)}`}><strong className="tabular-figures">{fareText(ride)}</strong><span>{ride.fare_status === 'estimated' ? 'Rate-card range · confirm in app' : ride.fare_status === 'model' ? 'Model prediction · confirm in app' : ride.fare_status === 'live' ? 'Provider API estimate · confirm in app' : 'Check fare in the provider app'}</span></div>
                   <div className="ride-action">
-                    <a className="provider-button" href={ride.booking?.url} target="_blank" rel="noopener noreferrer">Book on {ride.provider} <ExternalLink size={14} /></a>
-                    <span>{ride.booking?.prefilled ? 'Your route is pre-filled' : `Opens ${ride.provider} — enter your route there`}</span>
+                    <div className="ride-action-buttons">
+                      {!ride.booking?.prefilled && (
+                        <button
+                          type="button"
+                          className="copy-route-button"
+                          onClick={() => copyRouteForRide(ride.id)}
+                          title="Copy pickup and destination to paste in app"
+                          aria-label={`Copy route for ${ride.provider}`}
+                        >
+                          {copiedId === ride.id ? <Check size={13} /> : <Copy size={13} />}
+                        </button>
+                      )}
+                      <a
+                        className="provider-button"
+                        href={ride.booking?.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={() => { if (!ride.booking?.prefilled) copyRouteForRide(ride.id) }}
+                      >
+                        Book on {ride.provider} <ExternalLink size={14} />
+                      </a>
+                    </div>
+                    <span>
+                      {ride.booking?.prefilled
+                        ? 'Your route is pre-filled'
+                        : copiedId === ride.id
+                          ? `Route copied — paste in ${ride.provider}`
+                          : `Copies route & opens ${ride.provider}`}
+                    </span>
                   </div>
                 </article>)}
               </div>
@@ -264,7 +420,16 @@ function App() {
         </section>
       </main>
 
-      <footer className="footer"><a className="brand footer-brand" href="#top"><span className="brand-mark"><ArrowDownUp size={16} strokeWidth={2.8} /></span><span>cab<span>compare</span></span></a><span>Independent comparisons. Provider-led bookings.</span><span className="footer-status"><Zap size={13} /> Live fares not connected</span></footer>
+      <footer className="footer"><a className="brand footer-brand" href="#top"><span className="brand-mark"><ArrowDownUp size={16} strokeWidth={2.8} /></span><span>cab<span>compare</span></span></a><span>Independent comparisons. Provider-led bookings.</span><span className="footer-status"><Zap size={13} /> OpenStreetMap routing · Rate-card estimates</span></footer>
+
+      <MapPickerModal
+        open={mapPicker.open}
+        initialTarget={mapPicker.target}
+        pickup={pickup}
+        destination={destination}
+        onClose={() => setMapPicker((state) => ({ ...state, open: false }))}
+        onApply={applyPinnedRoute}
+      />
     </div>
   )
 }

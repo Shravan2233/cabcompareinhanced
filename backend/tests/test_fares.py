@@ -182,7 +182,7 @@ class ProviderFareTests(unittest.TestCase):
         self.assertTrue(all(ride["fare_status"] == "estimated" for ride in rides))
         self.assertTrue(all(ride["fare_low"] < ride["fare"] < ride["fare_high"] for ride in rides))
         self.assertTrue(all("surge" in ride["fare_disclaimer"] for ride in rides))
-        by_provider = {ride["provider"]: ride for ride in rides}
+        by_provider = {ride["provider"]: ride for ride in rides if ride["ride_type"] == "auto"}
         self.assertEqual(by_provider["Rapido"]["distance_km"], 8)
         self.assertEqual(by_provider["Namma Yatri"]["trip_duration_minutes"], 30)
 
@@ -198,10 +198,14 @@ class ProviderFareTests(unittest.TestCase):
             self.assertEqual(
                 {(ride["provider"], ride["ride_type"], ride["fare_status"]) for ride in estimates},
                 {
+                    ("Uber", "bike", "estimated"),
                     ("Uber", "auto", "estimated"),
                     ("Uber", "sedan", "estimated"),
+                    ("Uber", "premium", "estimated"),
+                    ("Ola", "bike", "estimated"),
                     ("Ola", "auto", "estimated"),
                     ("Ola", "sedan", "estimated"),
+                    ("Ola", "premium", "estimated"),
                 },
             )
             self.assertTrue(all(ride["currency"] == "INR" for ride in estimates))
@@ -213,10 +217,9 @@ class ProviderFareTests(unittest.TestCase):
                 for ride in estimates
             ))
             self.assertTrue(all("generic proxy" in ride["fare_estimate_note"] for ride in estimates))
-            self.assertTrue(all(
-                "Auto rates as an approved proxy" in ride["fare_estimate_note"]
-                for ride in estimates if ride["ride_type"] == "sedan"
-            ))
+            sedan_fare = next(r["fare"] for r in estimates if r["provider"] == "Uber" and r["ride_type"] == "sedan")
+            auto_fare = next(r["fare"] for r in estimates if r["provider"] == "Uber" and r["ride_type"] == "auto")
+            self.assertGreater(sedan_fare, auto_fare)
 
     def test_trained_model_predictions_precede_rate_cards(self):
         categories = {
@@ -348,6 +351,16 @@ class ProviderFareTests(unittest.TestCase):
                 {**UBER_ENV, **OLA_ENV},
             )
         self.assertTrue(all(ride["fare_status"] == "estimated" for ride in rides))
+
+    def test_city_rate_cards_differ_between_delhi_and_bengaluru(self):
+        metrics = {"distance_km": 10, "duration_minutes": 25}
+        blr = estimate_rides(metrics, pickup={"lat": 12.9784, "lng": 77.6408})
+        del_rides = estimate_rides(metrics, pickup={"lat": 28.6315, "lng": 77.2167})
+        blr_auto = next(r for r in blr if r["provider"] == "Namma Yatri" and r["ride_type"] == "auto")
+        del_auto = next(r for r in del_rides if r["provider"] == "Namma Yatri" and r["ride_type"] == "auto")
+        self.assertGreater(blr_auto["fare"], del_auto["fare"])
+        self.assertIn("Bengaluru", blr_auto["fare_estimate_note"])
+        self.assertIn("Delhi NCR", del_auto["fare_estimate_note"])
 
     def test_missing_route_metrics_make_estimated_provider_fares_unavailable(self):
         rides = comparison_rides(PICKUP, DROP, None, {})

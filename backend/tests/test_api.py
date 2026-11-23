@@ -116,9 +116,11 @@ class ApiTests(unittest.TestCase):
         )
 
     def test_cors_accepts_both_local_frontend_hosts(self):
-        for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+        for origin in ("http://localhost:5173", "http://127.0.0.1:5173", "http://127.0.0.1:5174"):
             response = self.client.get("/api/health", headers={"Origin": origin})
             self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), origin)
+        blocked = self.client.get("/api/health", headers={"Origin": "https://untrusted.example"})
+        self.assertIsNone(blocked.headers.get("Access-Control-Allow-Origin"))
 
 
 if __name__ == "__main__":
@@ -127,11 +129,28 @@ if __name__ == "__main__":
 class FreeRoutingTests(unittest.TestCase):
     def test_osm_lookup_is_used_when_browser_sends_no_metrics(self):
         found = {"metrics": {"distance_km": 9.4, "duration_minutes": 31},
-                 "pickup": {"lat": 12.9, "lng": 77.6}, "destination": {"lat": 12.96, "lng": 77.7}}
+                 "pickup": {"lat": 12.9, "lng": 77.6}, "destination": {"lat": 12.96, "lng": 77.7},
+                 "geometry": [[77.6, 12.9], [77.7, 12.96]]}
         with patch("cabcompare.backend.app.osm_route_metrics", return_value=found):
             client = create_app().test_client()
             response = client.post("/api/rides/compare", json={"pickup": "A", "destination": "B"})
         self.assertEqual(response.json["fare_source"], "estimated")
         self.assertEqual(response.json["route_metrics"]["distance_km"], 9.4)
+        self.assertEqual(response.json["route_geometry"], [[77.6, 12.9], [77.7, 12.96]])
         uber = next(r for r in response.json["rides"] if r["provider"] == "Uber")
         self.assertIn("12.96", unquote(uber["booking_url"]))
+
+    def test_place_suggest_and_reverse_endpoints(self):
+        sample = [{"id": "hub-0", "main": "Indiranagar", "secondary": "Bengaluru, Karnataka",
+                   "text": "Indiranagar, Bengaluru, Karnataka", "lat": 12.9784, "lng": 77.6408}]
+        with (
+            patch("cabcompare.backend.app.suggest_places", return_value=sample),
+            patch("cabcompare.backend.app.reverse_geocode", return_value="100 Feet Road, Bengaluru"),
+        ):
+            client = create_app().test_client()
+            s_resp = client.get("/api/places/suggest?q=Indira")
+            r_resp = client.get("/api/places/reverse?lat=12.9784&lng=77.6408")
+        self.assertEqual(s_resp.status_code, 200)
+        self.assertEqual(s_resp.json["suggestions"], sample)
+        self.assertEqual(r_resp.status_code, 200)
+        self.assertEqual(r_resp.json["text"], "100 Feet Road, Bengaluru")

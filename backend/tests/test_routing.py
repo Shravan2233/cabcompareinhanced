@@ -33,6 +33,48 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(routing.osm_route_metrics("A", None, "B", None, fetch=broken))
         self.assertIsNone(routing.osm_route_metrics("A", None, "B", None, fetch=lambda u: []))
 
+    def test_suggest_places_parses_photon_and_local_hubs(self):
+        def photon_fetch(url):
+            if "photon.komoot.io" in url:
+                return {
+                    "features": [{
+                        "geometry": {"coordinates": [77.6408, 12.9784]},
+                        "properties": {
+                            "osm_type": "N",
+                            "osm_id": 123,
+                            "name": "Indiranagar Metro Station",
+                            "city": "Bengaluru",
+                            "state": "Karnataka",
+                            "countrycode": "IN",
+                        },
+                    }]
+                }
+            return []
+
+        items = routing.suggest_places("Indira", fetch=photon_fetch)
+        self.assertTrue(any("Indiranagar" in item["text"] for item in items))
+        self.assertTrue(all("lat" in item and "lng" in item for item in items))
+
+    def test_reverse_geocode_parses_photon_response(self):
+        def photon_reverse(url):
+            return {
+                "features": [{
+                    "geometry": {"coordinates": [77.6408, 12.9784]},
+                    "properties": {
+                        "osm_type": "W",
+                        "osm_id": 456,
+                        "name": "100 Feet Road",
+                        "locality": "Indiranagar",
+                        "city": "Bengaluru",
+                        "state": "Karnataka",
+                        "countrycode": "IN",
+                    },
+                }]
+            }
+
+        label = routing.reverse_geocode(12.9784, 77.6408, fetch=photon_reverse)
+        self.assertEqual(label, "100 Feet Road, Indiranagar, Bengaluru, Karnataka")
+
 
 if __name__ == "__main__":
     unittest.main()

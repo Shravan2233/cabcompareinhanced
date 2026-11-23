@@ -1,14 +1,15 @@
 import os
+import re
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
 from .providers import PROVIDERS
-from .services.comparison import InvalidRoute, compare_rides, validate_route
-from .services.fares import comparison_rides
 from .providers.links import booking_for
+from .services.comparison import InvalidRoute, compare_rides, validate_route
 from .services.estimates import parse_metrics
-from .services.routing import osm_route_metrics
+from .services.fares import comparison_rides
+from .services.routing import osm_route_metrics, reverse_geocode, suggest_places
 
 load_dotenv()
 
@@ -26,6 +27,17 @@ def parse_coords(value):
     return {"lat": lat, "lng": lng}
 
 
+def _optional_near_coords():
+    lat = request.args.get("lat")
+    lng = request.args.get("lng")
+    if lat is None or lng is None:
+        return None
+    return parse_coords({"lat": lat, "lng": lng})
+
+
+_LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$")
+
+
 def create_app():
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
@@ -41,7 +53,7 @@ def create_app():
     @app.after_request
     def add_cors_headers(response):
         origin = request.headers.get("Origin")
-        if origin in frontend_origins:
+        if origin and (origin in frontend_origins or _LOCAL_ORIGIN_RE.fullmatch(origin)):
             response.headers["Access-Control-Allow-Origin"] = origin
             response.headers["Vary"] = "Origin"
             response.headers["Access-Control-Allow-Headers"] = "Content-Type"
@@ -55,6 +67,32 @@ def create_app():
     @app.get("/api/providers")
     def providers():
         return jsonify({"providers": PROVIDERS, "fare_mode": "hybrid"})
+
+    @app.get("/api/places/suggest")
+    def place_suggestions():
+        query = (request.args.get("q") or "").strip()
+        if len(query) < 2 or len(query) > 160:
+            return jsonify({"suggestions": [], "source": "openstreetmap"})
+        try:
+            near = _optional_near_coords()
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        return jsonify({
+            "suggestions": suggest_places(query, near=near),
+            "source": "openstreetmap",
+        })
+
+    @app.get("/api/places/reverse")
+    def place_reverse():
+        try:
+            coords = parse_coords({"lat": request.args.get("lat"), "lng": request.args.get("lng")})
+        except ValueError as error:
+            return jsonify({"error": str(error)}), 400
+        label = reverse_geocode(coords["lat"], coords["lng"])
+        return jsonify({
+            "text": label or f"Current location ({coords['lat']:.4f}, {coords['lng']:.4f})",
+            **coords,
+        })
 
     @app.get("/api/routes/popular")
     def popular_routes():
@@ -79,14 +117,19 @@ def create_app():
             pickup_text, destination_text = validate_route(payload.get("pickup"), payload.get("destination"))
         except ValueError as error:
             return jsonify({"error": str(error)}), 400
-        if (metrics is None and isinstance(pickup_text, str) and isinstance(destination_text, str)
-                and pickup_text.strip() and destination_text.strip()
-                and pickup_text.strip().casefold() != destination_text.strip().casefold()):
+
+        route_geometry = None
+        if (metrics is None or pickup_coords is None or destination_coords is None) and (
+            isinstance(pickup_text, str) and isinstance(destination_text, str)
+            and pickup_text.strip() and destination_text.strip()
+            and pickup_text.strip().casefold() != destination_text.strip().casefold()
+        ):
             found = osm_route_metrics(pickup_text.strip(), pickup_coords, destination_text.strip(), destination_coords)
             if found:
-                metrics = found["metrics"]
+                metrics = metrics or found["metrics"]
                 pickup_coords = pickup_coords or found["pickup"]
                 destination_coords = destination_coords or found["destination"]
+                route_geometry = found.get("geometry")
         try:
             result = compare_rides(
                 pickup_text,
@@ -114,6 +157,9 @@ def create_app():
             "pricing may change the fare. Confirm in the provider app."
         )
         result["route_metrics"] = metrics
+        result["route_geometry"] = route_geometry
+        if pickup_coords and destination_coords:
+            result["route_coords"] = {"pickup": pickup_coords, "destination": destination_coords}
         return jsonify(result)
 
     @app.errorhandler(413)

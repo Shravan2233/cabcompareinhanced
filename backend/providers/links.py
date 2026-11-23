@@ -2,20 +2,26 @@
 
 Every URL here is an https link on the provider's own domain, so on a phone
 with the app installed the OS can hand it to the app, and on desktop it opens
-the provider's website. Only Uber (documented "Ride Request" universal link)
-and Ola (book.olacabs.com web booking) accept a pre-filled route. Rapido and
-Namma Yatri have no public route-prefill link that we could verify, so those
-open the provider's official page and the user enters the route there.
+the provider's website. Only Uber (m.uber.com/looking) and Ola (book.olacabs.com)
+accept pre-filled route parameters. Rapido and Namma Yatri have no public web
+route-prefill link, so those open the provider's official page.
 
 Verify each format against the provider's current docs before production use,
 and edit ONLY this file if a provider changes its link scheme.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Any
-import json
 from urllib.parse import quote, urlencode
+
+_OLA_CATEGORIES = {
+    "bike": "bike",
+    "auto": "auto",
+    "sedan": "prime_sedan",
+    "premium": "prime_suv",
+}
 
 
 def _has_coords(place: dict[str, Any]) -> bool:
@@ -45,20 +51,21 @@ def ola_link(route: dict[str, Any], ride_type: str | None = None) -> dict[str, A
     """Ola web booking link (book.olacabs.com). Pickup and drop arrive pre-filled."""
     pickup, drop = route["pickup"], route["destination"]
     if not (_has_coords(pickup) and _has_coords(drop)):
-        # Ola needs coordinates; without them we can only open the booking page.
         return {"url": "https://book.olacabs.com/", "prefilled": False}
     params = {
         "serviceType": "p2p",
         "lat": f"{pickup['lat']:.6f}", "lng": f"{pickup['lng']:.6f}", "pickup": pickup["text"],
         "drop_lat": f"{drop['lat']:.6f}", "drop_lng": f"{drop['lng']:.6f}", "drop": drop["text"],
     }
+    category = _OLA_CATEGORIES.get((ride_type or "").casefold())
+    if category:
+        params["category"] = category
     return {"url": "https://book.olacabs.com/?" + urlencode(params), "prefilled": True}
 
 
 def rapido_link(route: dict[str, Any], ride_type: str | None = None) -> dict[str, Any]:
-    """Rapido has no documented prefill link. Once you confirm one (for example from the link
-    Comparify uses), set RAPIDO_LINK_TEMPLATE in .env using these placeholders:
-    {pickup_lat} {pickup_lng} {drop_lat} {drop_lng} {pickup_text} {drop_text} (text is URL-encoded)."""
+    """Rapido has no documented public web prefill link. Set RAPIDO_LINK_TEMPLATE in .env
+    with placeholders {pickup_lat} {pickup_lng} {drop_lat} {drop_lng} {pickup_text} {drop_text}."""
     template = os.getenv("RAPIDO_LINK_TEMPLATE")
     pickup, drop = route["pickup"], route["destination"]
     if template and _has_coords(pickup) and _has_coords(drop):

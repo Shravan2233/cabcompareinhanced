@@ -301,7 +301,7 @@ def comparison_rides(
                 for ride in rides
                 if ride["provider"] == provider and ride["fare_status"] == "live"
             }
-            fallback_rides = provider_rate_card_estimate_rides(provider, metrics, live_types)
+            fallback_rides = provider_rate_card_estimate_rides(provider, metrics, live_types, pickup)
             covered_types = live_types | {ride["ride_type"] for ride in fallback_rides}
             rides.extend(fallback_rides)
             uncovered_api_options.extend(

@@ -70,7 +70,7 @@ Database connection variables are placeholders in `.env.example`. The initial AP
 
 ## Maps and Provider Integrations
 
-No mapping credentials are required for route estimates if OpenStreetMap/OSRM can resolve the locations. Google Maps can provide autocomplete and route metrics. Browser geolocation is only a coordinate input in this release.
+No mapping credentials are required: place suggestions and reverse geocoding use OpenStreetMap (Komoot Photon + Nominatim fallback + Indian city hubs), driving distance/geometry uses OSRM, and the interactive route map uses MapLibre GL with OpenFreeMap vector tiles. Google Maps can still be enabled optionally by setting `VITE_GOOGLE_MAPS_API_KEY`. Browser geolocation resolves coordinates into a readable address when available.
 
 Fare access review (November 2026):
 
@@ -85,7 +85,7 @@ Provider tokens are read only by the backend from `.env`/environment variables a
 
 Fare resolution for Uber/Ola is: valid live API quote, then a route-based rate-card estimate when route metrics are available. For Rapido/Namma Yatri, a trained model prediction is used for categories represented in the model, then the existing provider rate card. Model inference and training run only on the backend.
 
-Uber/Ola route fallback averages matching existing Rapido/Namma Yatri rate-card calculations and presents the result only as `ESTIMATED FARE`, never as a provider quote. The current Uber/Ola options are Auto and Sedan; because there is no Sedan card, Sedan uses the existing Auto rates as an explicitly approved proxy. If you add Premium or other vehicle options, add an approved matching card or proxy before expecting those options to receive a route estimate. All fallback fares require driving distance and duration; without route metrics the fare remains unavailable.
+Uber/Ola route fallback applies provider multipliers to matching Bike, Auto, Sedan, and Premium rate-card calculations in `backend/providers/rates.py` and presents the result only as `ESTIMATED FARE`, never as a provider quote. All fallback fares require driving distance and duration; without route metrics the fare remains unavailable.
 
 1. Collect **real, labeled fares** from authorized sources. Do not use synthetic rows or provider-app scraping. Each row represents an observed fare and its route features.
 2. Use the columns in [`backend/models/fare_training_schema.csv`](backend/models/fare_training_schema.csv): `provider`, `vehicle`, `time_of_day`, `currency`, `distance_km`, `duration_minutes`, `pickup_lat`, `pickup_lng`, `destination_lat`, `destination_lng`, and `fare`. `time_of_day` must be `morning`, `afternoon`, `evening`, or `night` in India Standard Time. A dataset must have at least five complete labeled rows and contain a single currency.

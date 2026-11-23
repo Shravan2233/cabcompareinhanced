@@ -17,7 +17,14 @@ from ..models.schema import (
     current_time_of_day,
 )
 from ..providers.options import RIDE_OPTIONS
-from ..providers.rates import HIGH_FACTOR, LOW_FACTOR, RATE_CARDS
+from ..providers.rates import (
+    HIGH_FACTOR,
+    LOW_FACTOR,
+    PROVIDER_MULTIPLIERS,
+    city_rate_cards,
+    detect_city,
+    time_factor,
+)
 
 MAX_KM = 500
 MAX_MINUTES = 24 * 60
@@ -147,12 +154,18 @@ def model_estimate_rides(
     ]
 
 
-def rate_card_estimate_rides(metrics: dict[str, float]) -> list[dict[str, Any]]:
-    """Estimate Rapido and Namma Yatri fares from rate cards; never present them as live."""
+def rate_card_estimate_rides(
+    metrics: dict[str, float],
+    pickup: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Estimate Rapido and Namma Yatri fares from city rate cards; never present them as live."""
     km, minutes = metrics["distance_km"], metrics["duration_minutes"]
+    city_key, city_label = detect_city(pickup)
+    cards = city_rate_cards(city_key)
     rides = []
-    for provider, vehicle, ride_type, base, included_km, per_km, per_minute, minimum, multiplier in RATE_CARDS:
-        raw_fare = (base + per_km * max(km - included_km, 0) + per_minute * minutes) * multiplier
+    for provider, vehicle, ride_type, base, included_km, per_km, per_minute, minimum, multiplier in cards:
+        t_mult, period_label = time_factor(city_key, provider, ride_type)
+        raw_fare = (base + per_km * max(km - included_km, 0) + per_minute * minutes) * multiplier * t_mult
         fare = round(max(minimum, raw_fare))
         rides.append({
             "id": f"{provider.lower().replace(' ', '-')}-{ride_type}-estimate",
@@ -169,6 +182,7 @@ def rate_card_estimate_rides(metrics: dict[str, float]) -> list[dict[str, Any]]:
             "trip_duration_minutes": minutes,
             "distance_km": km,
             "fare_disclaimer": RATE_CARD_DISCLAIMER,
+            "fare_estimate_note": f"{city_label} rate card ({period_label}).",
         })
     return rides
 
@@ -177,9 +191,12 @@ def provider_rate_card_estimate_rides(
     provider: str,
     metrics: dict[str, float],
     excluded_ride_types: set[str] | None = None,
+    pickup: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Estimate a provider's remaining options from matching shared rate cards."""
+    """Estimate a provider's remaining options from matching city rate cards."""
     excluded_ride_types = excluded_ride_types or set()
+    city_key, city_label = detect_city(pickup)
+    all_cards = city_rate_cards(city_key)
     options = [
         ride for ride in RIDE_OPTIONS
         if ride["provider"] == provider and ride["ride_type"] not in excluded_ride_types
@@ -187,25 +204,27 @@ def provider_rate_card_estimate_rides(
     estimates = []
     for ride in options:
         rate_type = ride["ride_type"]
-        cards = [card for card in RATE_CARDS if card[2] == rate_type]
+        cards = [card for card in all_cards if card[2] == rate_type]
         uses_auto_proxy = False
         if not cards and rate_type in {"sedan", "premium"}:
-            cards = [card for card in RATE_CARDS if card[2] == "auto"]
+            cards = [card for card in all_cards if card[2] == "auto"]
             uses_auto_proxy = bool(cards)
         if not cards:
             continue
 
         km, minutes = metrics["distance_km"], metrics["duration_minutes"]
+        provider_factor = PROVIDER_MULTIPLIERS.get(provider, 1.0)
+        t_mult, period_label = time_factor(city_key, provider, rate_type)
         card_fares = [
             max(card[7], (
                 card[3] + card[5] * max(km - card[4], 0) + card[6] * minutes
-            ) * card[8])
+            ) * card[8] * provider_factor * t_mult)
             for card in cards
         ]
         fare = round(sum(card_fares) / len(card_fares))
         estimate_note = (
-            "Uses the existing Rapido/Namma Yatri rate cards as a generic proxy, not a "
-            f"quote from {provider}."
+            f"{city_label} rate card ({period_label}); uses Rapido/Namma Yatri cards as a generic proxy, "
+            f"not a quote from {provider}."
         )
         if uses_auto_proxy:
             estimate_note += " Sedan/Premium uses Auto rates as an approved proxy."
@@ -235,9 +254,9 @@ def estimate_rides(
     drop: dict[str, Any] | None = None,
     model_path: Path = MODEL_PATH,
 ) -> list[dict[str, Any]]:
-    """Resolve route estimates in order: trained model, then provider rate cards."""
+    """Resolve route estimates in order: trained model, then city provider rate cards."""
     model_rides = model_estimate_rides(metrics, pickup, drop, model_path)
-    rate_rides = rate_card_estimate_rides(metrics)
+    rate_rides = rate_card_estimate_rides(metrics, pickup=pickup)
     model_keys = {(ride["provider"], ride["ride_type"]) for ride in model_rides}
     return model_rides + [
         ride for ride in rate_rides

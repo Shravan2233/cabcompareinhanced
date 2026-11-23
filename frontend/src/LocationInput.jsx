@@ -2,30 +2,51 @@ import { useEffect, useRef, useState } from 'react'
 import { MapPin, X } from 'lucide-react'
 import { mapsEnabled, newSessionToken, placeCoordinates, suggestPlaces } from './maps.js'
 
-// Combobox with Google Places suggestions. Works as a plain text field when no Maps key is set.
-export default function LocationInput({ kicker, label, dotClass, value, onTyping, onPick, placeholder, inputRef, children }) {
+// Combobox with place autocomplete (OpenStreetMap by default, Google Places if configured).
+export default function LocationInput({
+  kicker, label, dotClass, value, near = null, onTyping, onPick, placeholder, inputRef, children,
+}) {
   const [items, setItems] = useState([])
   const [open, setOpen] = useState(false)
   const [active, setActive] = useState(-1)
   const [busy, setBusy] = useState(false)
+  const [searched, setSearched] = useState(false)
   const token = useRef(null)
   const wrapper = useRef(null)
   const text = value.text || ''
+  const nearLat = near?.lat ?? null
+  const nearLng = near?.lng ?? null
 
   useEffect(() => {
-    if (!mapsEnabled || !open || text.trim().length < 3 || value.lat != null) { setItems([]); return undefined }
+    if (!open || text.trim().length < 2 || value.lat != null) {
+      setItems([])
+      setBusy(false)
+      setSearched(false)
+      return undefined
+    }
     let cancelled = false
+    setBusy(true)
     const timer = setTimeout(async () => {
-      setBusy(true)
       try {
-        token.current = token.current || (await newSessionToken())
-        const found = await suggestPlaces(text.trim(), token.current)
-        if (!cancelled) { setItems(found.slice(0, 5)); setActive(-1) }
-      } catch { if (!cancelled) setItems([]) }
-      finally { if (!cancelled) setBusy(false) }
-    }, 250)
+        if (mapsEnabled) token.current = token.current || (await newSessionToken())
+        const bias = nearLat != null && nearLng != null ? { lat: nearLat, lng: nearLng } : null
+        const found = await suggestPlaces(text.trim(), token.current, bias)
+        if (!cancelled) {
+          setItems(found.slice(0, 6))
+          setActive(-1)
+          setSearched(true)
+        }
+      } catch {
+        if (!cancelled) {
+          setItems([])
+          setSearched(true)
+        }
+      } finally {
+        if (!cancelled) setBusy(false)
+      }
+    }, 220)
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [text, open, value.lat])
+  }, [text, open, value.lat, nearLat, nearLng])
 
   useEffect(() => {
     const close = (event) => { if (!wrapper.current?.contains(event.target)) setOpen(false) }
@@ -34,10 +55,15 @@ export default function LocationInput({ kicker, label, dotClass, value, onTyping
   }, [])
 
   async function choose(item) {
-    setOpen(false); setItems([])
-    onPick({ text: item.text }) // show the label immediately
-    try { onPick(await placeCoordinates(item)) } catch { /* label alone is still usable */ }
-    token.current = null // a session ends once a place is selected
+    setOpen(false)
+    setItems([])
+    onPick({ text: item.text, lat: item.lat, lng: item.lng })
+    try {
+      onPick(await placeCoordinates(item))
+    } catch {
+      /* label alone is still usable */
+    }
+    token.current = null
   }
 
   function onKeyDown(event) {
@@ -61,18 +87,38 @@ export default function LocationInput({ kicker, label, dotClass, value, onTyping
           onChange={(event) => { onTyping(event.target.value); setOpen(true) }}
         />
       </span>
-      {text && <button type="button" className="clear-button" aria-label={`Clear ${label.toLowerCase()}`} onClick={() => { onTyping(''); inputRef?.current?.focus() }}><X size={14} /></button>}
+      {text && (
+        <button
+          type="button" className="clear-button" aria-label={`Clear ${label.toLowerCase()}`}
+          onClick={() => { onTyping(''); setItems([]); inputRef?.current?.focus() }}
+        >
+          <X size={14} />
+        </button>
+      )}
       {children}
-      {open && (items.length > 0 || busy) && (
+      {open && (items.length > 0 || busy || searched) && (
         <ul className="suggestions" id={listId} role="listbox">
           {items.map((item, index) => (
-            <li key={item.id} role="option" aria-selected={index === active} className={index === active ? 'active' : ''}
-              onMouseDown={(event) => { event.preventDefault(); choose(item) }} onMouseEnter={() => setActive(index)}>
-              <MapPin size={16} /><span><strong>{item.main}</strong><small>{item.secondary}</small></span>
+            <li
+              key={item.id} role="option" aria-selected={index === active} className={index === active ? 'active' : ''}
+              onMouseDown={(event) => { event.preventDefault(); choose(item) }} onMouseEnter={() => setActive(index)}
+            >
+              <MapPin size={16} />
+              <span>
+                <strong>{item.main}</strong>
+                <small>{item.secondary}</small>
+              </span>
             </li>
           ))}
           {busy && !items.length && <li className="suggestions-note">Searching places…</li>}
-          {items.length > 0 && <li className="suggestions-note powered">Powered by Google</li>}
+          {!busy && searched && !items.length && (
+            <li className="suggestions-note">No suggestions yet — keep typing or enter full area/city</li>
+          )}
+          {items.length > 0 && (
+            <li className="suggestions-note powered">
+              {mapsEnabled ? 'Powered by Google' : 'Suggestions via OpenStreetMap'}
+            </li>
+          )}
         </ul>
       )}
     </div>
