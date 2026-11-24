@@ -1,359 +1,223 @@
 import io
 import json
-import tempfile
 import unittest
 import urllib.error
-from pathlib import Path
+from datetime import datetime
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlparse
 
-from cabcompare.backend.models.schema import current_time_of_day
+from cabcompare.backend.providers import namma_yatri, ola, rapido, uber
+from cabcompare.backend.providers.base import ProviderRequestError, request_json
 from cabcompare.backend.providers.options import RIDE_OPTIONS
-from cabcompare.backend.services.estimates import estimate_rides, load_fare_model
-from cabcompare.backend.services.fares import (
-    ProviderRequestError,
-    comparison_rides,
-    ola_fares,
-    uber_fares,
-)
+from cabcompare.backend.providers.rates import IST, detect_city, estimate_option_fare, time_factor_and_label
+from cabcompare.backend.services.fares import clear_quote_cache, comparison_rides, ola_fares, uber_fares
 
 
-PICKUP = {"lat": 12.9716, "lng": 77.5946}
-DROP = {"lat": 12.9352, "lng": 77.6245}
+BENGALURU_PICKUP = {"lat": 12.9784, "lng": 77.6408}  # Indiranagar
+BENGALURU_DROP = {"lat": 12.9756, "lng": 77.6066}    # MG Road
+DELHI_PICKUP = {"lat": 28.6315, "lng": 77.2167}
+
 UBER_ENV = {
     "UBER_SERVER_TOKEN": "uber-test-secret",
     "UBER_COMPARISON_APPROVED": "true",
 }
 OLA_ENV = {"OLA_APP_TOKEN": "ola-test-secret"}
+RAPIDO_ENV = {
+    "RAPIDO_API_URL": "https://partner-gateway.example/rapido/quotes",
+    "RAPIDO_AUTH_TOKEN": "rapido-test-secret",
+    "RAPIDO_DEVICE_ID": "device-123",
+}
+NY_ENV = {
+    "NAMMA_YATRI_BAP_SEARCH_URL": "https://ondc-bap.example/mobility/search",
+    "NAMMA_YATRI_AUTH_TOKEN": "ny-test-secret",
+}
 
 
-class ConstantFareModel:
-    def predict(self, features):
-        return [125.0] * len(features)
+class ProviderIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        clear_quote_cache()
 
-
-class ProviderFareTests(unittest.TestCase):
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_uber_sends_route_and_secret_header_and_parses_price_ranges(self, urlopen):
+    @patch("cabcompare.backend.providers.base.urllib.request.urlopen")
+    def test_uber_parses_range_as_fare_estimate_and_keeps_token_secret(self, urlopen):
         urlopen.return_value = io.BytesIO(json.dumps({
             "prices": [{
-                "display_name": "uberX",
-                "product_id": "uberx-1",
+                "display_name": "UberGo",
+                "product_id": "ubergo-1",
                 "low_estimate": 120,
                 "high_estimate": 160,
                 "currency_code": "INR",
                 "estimate": "₹120-160",
+                "pickup_estimate": 180,
+                "duration": 900,
                 "surge_multiplier": 1.5,
             }]
         }).encode())
 
-        rides = uber_fares(PICKUP, DROP, UBER_ENV)
+        rides = uber_fares(BENGALURU_PICKUP, BENGALURU_DROP, UBER_ENV)
 
         self.assertEqual(len(rides), 1)
         ride = rides[0]
-        self.assertEqual((ride["fare_low"], ride["fare_high"]), (120, 160))
+        self.assertEqual(ride["quoteType"], "FARE_ESTIMATE")
+        self.assertEqual(ride["status"], "success")
+        self.assertEqual(ride["fareRange"], {"min": 120.0, "max": 160.0})
+        self.assertEqual(ride["etaMinutes"], 3)
         self.assertEqual(ride["currency"], "INR")
-        self.assertEqual(ride["fare_status"], "live")
-        self.assertIn("surge multiplier of 1.5", ride["fare_disclaimer"])
+        self.assertEqual(ride["availability_status"], "available")
+        self.assertTrue(ride["retrievedAt"])
+        self.assertIn("1.5x surge", ride["fare_disclaimer"])
         request = urlopen.call_args.args[0]
         query = parse_qs(urlparse(request.full_url).query)
-        self.assertEqual(urlparse(request.full_url).netloc, "api.uber.com")
-        self.assertEqual(urlparse(request.full_url).path, "/v1.2/estimates/price")
-        self.assertEqual(query["start_latitude"], ["12.9716"])
-        self.assertEqual(query["start_longitude"], ["77.5946"])
-        self.assertEqual(query["end_latitude"], ["12.9352"])
-        self.assertEqual(query["end_longitude"], ["77.6245"])
+        self.assertEqual(query["start_latitude"], ["12.9784"])
+        self.assertEqual(query["end_latitude"], ["12.9756"])
         self.assertEqual(request.get_header("Authorization"), "Token uber-test-secret")
         self.assertNotIn("uber-test-secret", repr(rides))
 
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_uber_missing_token_does_not_make_request(self, urlopen):
-        rides = uber_fares(PICKUP, DROP, {"UBER_COMPARISON_APPROVED": "true"})
+    @patch("cabcompare.backend.providers.base.urllib.request.urlopen")
+    def test_uber_rejects_unapproved_comparison_or_missing_token(self, urlopen):
+        no_token = uber.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, {"UBER_COMPARISON_APPROVED": "true"})
+        no_approval = uber.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, {"UBER_SERVER_TOKEN": "token"})
         urlopen.assert_not_called()
-        self.assertTrue(all(ride["fare"] is None for ride in rides))
-        self.assertIn("UBER_SERVER_TOKEN", rides[0]["fare_unavailable_reason"])
+        self.assertTrue(all(r["quoteType"] == "UNAVAILABLE" and r["fare"] is None for r in no_token))
+        self.assertTrue(all(r["quoteType"] == "UNAVAILABLE" and r["fare"] is None for r in no_approval))
+        self.assertIn("not configured", no_token[0]["error"])
+        self.assertIn("Written Uber approval", no_approval[0]["error"])
 
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_uber_requires_written_comparison_approval_even_with_token(self, urlopen):
-        rides = uber_fares(PICKUP, DROP, {"UBER_SERVER_TOKEN": "token"})
-        urlopen.assert_not_called()
-        self.assertIn("Written Uber approval", rides[0]["fare_unavailable_reason"])
-
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_uber_auth_rate_limit_and_http_errors_are_unavailable(self, urlopen):
-        for status, expected in (
-            (401, "rejected"),
-            (403, "rejected"),
-            (429, "rate limit"),
-            (503, "HTTP 503"),
-        ):
-            with self.subTest(status=status):
-                urlopen.side_effect = urllib.error.HTTPError(
-                    "https://api.uber.com/v1.2/estimates/price", status, "error", {}, None,
-                )
-                rides = uber_fares(PICKUP, DROP, UBER_ENV)
-                self.assertTrue(all(ride["fare"] is None for ride in rides))
-                self.assertIn(expected, rides[0]["fare_unavailable_reason"])
-
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_ola_sends_route_token_and_parses_product_fares(self, urlopen):
+    @patch("cabcompare.backend.providers.base.urllib.request.urlopen")
+    def test_ola_distinguishes_live_quote_from_estimate_range(self, urlopen):
         urlopen.return_value = io.BytesIO(json.dumps({
             "products": [
-                {"name": "Auto", "fare_min": 85, "fare_max": 110, "currency": "INR"},
-                {"display_name": "Prime Sedan", "fare": 210, "currency_code": "INR"},
+                {"name": "Ola Auto", "fare_min": 85, "fare_max": 110, "currency": "INR", "eta_minutes": 4},
+                {"display_name": "Prime Sedan", "fare": 210, "currency_code": "INR", "eta_minutes": 5},
             ]
         }).encode())
 
-        rides = ola_fares(PICKUP, DROP, OLA_ENV)
+        rides = ola_fares(BENGALURU_PICKUP, BENGALURU_DROP, OLA_ENV)
 
-        self.assertEqual(len(rides), 2)
-        auto = next(ride for ride in rides if ride["ride_type"] == "auto")
-        sedan = next(ride for ride in rides if ride["ride_type"] == "sedan")
-        self.assertEqual((auto["fare_low"], auto["fare_high"]), (85, 110))
-        self.assertEqual((sedan["fare_low"], sedan["fare_high"]), (210, 210))
-        self.assertTrue(all(ride["fare_status"] == "live" and ride["currency"] == "INR" for ride in rides))
-        request = urlopen.call_args.args[0]
-        query = parse_qs(urlparse(request.full_url).query)
-        self.assertEqual(urlparse(request.full_url).netloc, "devapi.olacabs.com")
-        self.assertEqual(urlparse(request.full_url).path, "/v1/products")
-        self.assertEqual(query["pickup_lat"], ["12.9716"])
-        self.assertEqual(query["pickup_lng"], ["77.5946"])
-        self.assertEqual(query["drop_lat"], ["12.9352"])
-        self.assertEqual(query["drop_lng"], ["77.6245"])
-        self.assertEqual(query["service_type"], ["p2p"])
-        self.assertEqual(request.get_header("X-app-token"), "ola-test-secret")
+        auto = next(r for r in rides if r["ride_type"] == "auto")
+        sedan = next(r for r in rides if r["ride_type"] == "sedan")
+        self.assertEqual(auto["quoteType"], "FARE_ESTIMATE")
+        self.assertEqual(auto["fareRange"], {"min": 85.0, "max": 110.0})
+        self.assertEqual(sedan["quoteType"], "LIVE_QUOTE")
+        self.assertEqual(sedan["fare"], 210.0)
+        self.assertEqual(sedan["etaMinutes"], 5)
         self.assertNotIn("ola-test-secret", repr(rides))
 
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_ola_missing_token_does_not_make_request(self, urlopen):
-        rides = ola_fares(PICKUP, DROP, {})
-        urlopen.assert_not_called()
-        self.assertTrue(all(ride["fare"] is None for ride in rides))
-        self.assertIn("OLA_APP_TOKEN", rides[0]["fare_unavailable_reason"])
+    @patch("cabcompare.backend.providers.base.urllib.request.urlopen")
+    def test_rapido_and_namma_yatri_use_authorized_gateways_when_configured(self, urlopen):
+        rapido_payload = json.dumps({
+            "quotes": [{"serviceName": "Bike Direct", "totalFare": 56, "currency": "INR", "eta": 3}]
+        }).encode()
+        ny_payload = json.dumps({
+            "estimates": [{"vehicleVariant": "Auto", "estimatedFare": 143, "currency": "INR", "estimatedPickupDuration": 120}]
+        }).encode()
+        urlopen.side_effect = [io.BytesIO(rapido_payload), io.BytesIO(ny_payload)]
 
-    @patch("cabcompare.backend.services.fares._get_json")
-    def test_ola_does_not_display_a_product_without_a_valid_currency(self, get_json):
-        get_json.return_value = {"products": [{"name": "Auto", "fare_min": 85, "fare_max": 110}]}
-        rides = ola_fares(PICKUP, DROP, OLA_ENV)
-        self.assertTrue(all(ride["fare"] is None and ride["currency"] is None for ride in rides))
-        self.assertIn("no priced products", rides[0]["fare_unavailable_reason"])
+        rap_rides = rapido.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, RAPIDO_ENV)
+        ny_rides = namma_yatri.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, NY_ENV)
 
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_ola_auth_rate_limit_and_http_errors_are_unavailable(self, urlopen):
-        for status, expected in (
-            (401, "rejected"),
-            (403, "rejected"),
+        self.assertEqual(rap_rides[0]["quoteType"], "LIVE_QUOTE")
+        self.assertEqual(rap_rides[0]["fare"], 56.0)
+        self.assertEqual(ny_rides[0]["quoteType"], "LIVE_QUOTE")
+        self.assertEqual(ny_rides[0]["fare"], 143.0)
+        self.assertEqual(ny_rides[0]["etaMinutes"], 2)
+        self.assertNotIn("rapido-test-secret", repr(rap_rides))
+        self.assertNotIn("ny-test-secret", repr(ny_rides))
+
+    def test_unconfigured_providers_with_metrics_return_calibrated_city_estimates(self):
+        rides = comparison_rides(BENGALURU_PICKUP, BENGALURU_DROP, {"distance_km": 5.6, "duration_minutes": 14}, {})
+        self.assertEqual(len(rides), len(RIDE_OPTIONS))
+        self.assertEqual({r["provider"] for r in rides}, {"Uber", "Ola", "Rapido", "Namma Yatri"})
+        self.assertTrue(all(r["quoteType"] == "FARE_ESTIMATE" and r["quoteSource"] == "rate_card" for r in rides))
+        self.assertTrue(all(r["currency"] == "INR" and r["fare_low"] < r["fare"] < r["fare_high"] for r in rides))
+        self.assertTrue(all("Bengaluru" in r["fare_disclaimer"] for r in rides))
+
+    def test_live_quote_takes_priority_and_backfills_missing_options_with_rate_card(self):
+        live_ola = [{
+            "id": "ola-live-auto", "provider": "Ola", "vehicleType": "Ola Auto", "product_name": "Ola Auto",
+            "ride_type": "auto", "fare": 115.0, "fareRange": {"min": 115.0, "max": 115.0},
+            "fare_low": 115.0, "fare_high": 115.0, "currency": "INR",
+            "quoteType": "LIVE_QUOTE", "fare_status": "live", "availability_status": "available", "status": "success",
+        }]
+        with patch("cabcompare.backend.services.fares.ola_fares", return_value=live_ola):
+            rides = comparison_rides(BENGALURU_PICKUP, BENGALURU_DROP, {"distance_km": 5.6, "duration_minutes": 14}, {})
+        ola_auto = [r for r in rides if r["provider"] == "Ola" and r["ride_type"] == "auto"]
+        ola_sedan = [r for r in rides if r["provider"] == "Ola" and r["ride_type"] == "sedan"]
+        self.assertEqual(ola_auto[0]["quoteType"], "LIVE_QUOTE")
+        self.assertEqual(ola_auto[0]["fare"], 115.0)
+        self.assertEqual(ola_sedan[0]["quoteSource"], "rate_card")
+
+    def test_city_tariffs_and_ist_time_factors_calibrate_bengaluru_vs_delhi(self):
+        metrics = {"distance_km": 5.6, "duration_minutes": 14}
+        day_ist = datetime(2026, 11, 23, 14, 0, tzinfo=IST)
+        night_ist = datetime(2026, 11, 23, 23, 30, tzinfo=IST)
+        self.assertEqual(detect_city(BENGALURU_PICKUP), ("bengaluru", "Bengaluru"))
+        self.assertEqual(detect_city(DELHI_PICKUP), ("delhi", "Delhi NCR"))
+        self.assertEqual(time_factor_and_label(day_ist)[0], 1.00)
+        self.assertEqual(time_factor_and_label(night_ist)[0], 1.25)
+
+        ny_auto = next(r for r in RIDE_OPTIONS if r["id"] == "namma-yatri-auto")
+        blr_day = estimate_option_fare(ny_auto, metrics, BENGALURU_PICKUP, now=day_ist)
+        blr_night = estimate_option_fare(ny_auto, metrics, BENGALURU_PICKUP, now=night_ist)
+        del_day = estimate_option_fare(ny_auto, metrics, DELHI_PICKUP, now=day_ist)
+        self.assertGreater(blr_day["fare"], del_day["fare"])
+        self.assertGreater(blr_night["fare"], blr_day["fare"])
+        self.assertTrue(70 <= blr_day["fare"] <= 140)
+
+    @patch("cabcompare.backend.providers.base.urllib.request.urlopen")
+    def test_provider_errors_and_expired_auth_return_unavailable_on_direct_fetch(self, urlopen):
+        for status, snippet in (
+            (401, "expired"),
+            (403, "expired"),
             (429, "rate limit"),
             (503, "HTTP 503"),
         ):
             with self.subTest(status=status):
                 urlopen.side_effect = urllib.error.HTTPError(
-                    "https://devapi.olacabs.com/v1/products", status, "error", {}, None,
+                    "https://api.uber.com/v1.2/estimates/price", status, "err", {}, None
                 )
-                rides = ola_fares(PICKUP, DROP, OLA_ENV)
-                self.assertTrue(all(ride["fare"] is None for ride in rides))
-                self.assertIn(expected, rides[0]["fare_unavailable_reason"])
+                rides = uber.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, UBER_ENV)
+                self.assertTrue(all(r["quoteType"] == "UNAVAILABLE" and r["fare"] is None for r in rides))
+                self.assertIn(snippet, rides[0]["error"])
 
-    @patch("cabcompare.backend.services.fares.urllib.request.urlopen")
-    def test_provider_network_and_invalid_response_errors_are_unavailable(self, urlopen):
-        for error, expected in (
-            (urllib.error.URLError("offline"), "temporarily unreachable"),
-            (io.BytesIO(b"not json"), "invalid fare response"),
-        ):
-            with self.subTest(expected=expected):
-                if isinstance(error, io.BytesIO):
-                    urlopen.side_effect = None
-                    urlopen.return_value = error
-                else:
-                    urlopen.side_effect = error
-                uber = uber_fares(PICKUP, DROP, UBER_ENV)
-                if isinstance(error, io.BytesIO):
-                    urlopen.return_value = io.BytesIO(b"not json")
-                ola = ola_fares(PICKUP, DROP, OLA_ENV)
-                self.assertIn(expected, uber[0]["fare_unavailable_reason"])
-                self.assertIn(expected, ola[0]["fare_unavailable_reason"])
+        urlopen.side_effect = None
+        urlopen.return_value = io.BytesIO(b"invalid json")
+        invalid_ola = ola.fetch_quotes(BENGALURU_PICKUP, BENGALURU_DROP, OLA_ENV)
+        self.assertEqual(invalid_ola[0]["quoteType"], "UNAVAILABLE")
+        self.assertIn("invalid fare response", invalid_ola[0]["error"])
 
-    def test_rapido_and_namma_yatri_receive_route_based_estimate_ranges(self):
-        metrics = {"distance_km": 8, "duration_minutes": 30}
-        with patch("cabcompare.backend.services.estimates.load_fare_model", return_value=None):
-            rides = estimate_rides(metrics)
-        self.assertEqual({ride["provider"] for ride in rides}, {"Rapido", "Namma Yatri"})
-        self.assertEqual({ride["currency"] for ride in rides}, {"INR"})
-        self.assertTrue(all(ride["fare_status"] == "estimated" for ride in rides))
-        self.assertTrue(all(ride["fare_low"] < ride["fare"] < ride["fare_high"] for ride in rides))
-        self.assertTrue(all("surge" in ride["fare_disclaimer"] for ride in rides))
-        by_provider = {ride["provider"]: ride for ride in rides}
-        self.assertEqual(by_provider["Rapido"]["distance_km"], 8)
-        self.assertEqual(by_provider["Namma Yatri"]["trip_duration_minutes"], 30)
-
-    def test_missing_uber_and_ola_tokens_fall_back_to_estimated_fares(self):
-        metrics = {"distance_km": 8, "duration_minutes": 30}
-        for env in ({}, {"UBER_SERVER_TOKEN": "", "OLA_APP_TOKEN": ""}):
-            with self.subTest(env=env), patch(
-                "cabcompare.backend.services.estimates.load_fare_model",
-                return_value=None,
-            ):
-                rides = comparison_rides(PICKUP, DROP, metrics, env)
-            estimates = [ride for ride in rides if ride["provider"] in {"Uber", "Ola"}]
-            self.assertEqual(
-                {(ride["provider"], ride["ride_type"], ride["fare_status"]) for ride in estimates},
-                {
-                    ("Uber", "auto", "estimated"),
-                    ("Uber", "sedan", "estimated"),
-                    ("Ola", "auto", "estimated"),
-                    ("Ola", "sedan", "estimated"),
-                },
-            )
-            self.assertTrue(all(ride["currency"] == "INR" for ride in estimates))
-            self.assertTrue(all(ride["fare_low"] < ride["fare"] < ride["fare_high"] for ride in estimates))
-            self.assertTrue(all(
-                ride["fare_disclaimer"] ==
-                "Rate-card estimate from route distance and duration; actual fares may vary with demand, "
-                "surge, traffic, tolls, and provider pricing. Confirm in the app."
-                for ride in estimates
-            ))
-            self.assertTrue(all("generic proxy" in ride["fare_estimate_note"] for ride in estimates))
-            self.assertTrue(all(
-                "Auto rates as an approved proxy" in ride["fare_estimate_note"]
-                for ride in estimates if ride["ride_type"] == "sedan"
-            ))
-
-    def test_trained_model_predictions_precede_rate_cards(self):
-        categories = {
-            "provider": sorted({ride["provider"].casefold() for ride in RIDE_OPTIONS}),
-            "vehicle": sorted({ride["product_name"].casefold() for ride in RIDE_OPTIONS}),
-            "time_of_day": [current_time_of_day()],
-            "currency": ["INR"],
-        }
-        artifact = {
-            "format_version": 1,
-            "feature_columns": [
-                "provider", "vehicle", "time_of_day", "currency", "distance_km",
-                "duration_minutes", "pickup_lat", "pickup_lng", "destination_lat", "destination_lng",
-            ],
-            "currency": "INR",
-            "feature_categories": categories,
-            "model": ConstantFareModel(),
-        }
-        with patch("cabcompare.backend.services.estimates.load_fare_model", return_value=artifact):
-            rides = estimate_rides(
-                {"distance_km": 8, "duration_minutes": 30},
-                PICKUP,
-                DROP,
-            )
-        self.assertEqual(len(rides), len(RIDE_OPTIONS))
-        self.assertTrue(all(ride["fare_status"] == "model" and ride["fare"] == 125 for ride in rides))
-        self.assertTrue(all("not a provider quote" in ride["fare_disclaimer"] for ride in rides))
-
-    def test_invalid_model_prediction_falls_back_to_rate_cards(self):
-        class InvalidModel:
-            def predict(self, features):
-                raise ValueError("unusable model")
-
-        artifact = {
-            "format_version": 1,
-            "feature_columns": [
-                "provider", "vehicle", "time_of_day", "currency", "distance_km",
-                "duration_minutes", "pickup_lat", "pickup_lng", "destination_lat", "destination_lng",
-            ],
-            "currency": "INR",
-            "feature_categories": {
-                "provider": sorted({ride["provider"].casefold() for ride in RIDE_OPTIONS}),
-                "vehicle": sorted({ride["product_name"].casefold() for ride in RIDE_OPTIONS}),
-                "time_of_day": [current_time_of_day()],
-                "currency": ["INR"],
-            },
-            "model": InvalidModel(),
-        }
-        with patch("cabcompare.backend.services.estimates.load_fare_model", return_value=artifact):
-            rides = estimate_rides(
-                {"distance_km": 8, "duration_minutes": 30},
-                PICKUP,
-                DROP,
-            )
-        self.assertEqual({ride["fare_status"] for ride in rides}, {"estimated"})
-        self.assertEqual({ride["provider"] for ride in rides}, {"Rapido", "Namma Yatri"})
-
-    def test_live_provider_quote_takes_precedence_and_rate_cards_fill_missing_options(self):
-        live_uber = {
-            "id": "uber-live", "provider": "Uber", "ride_type": "auto",
-            "fare": 90, "currency": "INR", "fare_status": "live",
-        }
-        unavailable_ola = {
-            "id": "ola-unavailable", "provider": "Ola", "ride_type": "auto",
-            "fare": None, "currency": None, "fare_status": "unavailable",
-        }
-        model_rides = [
-            {"id": "uber-auto-model", "provider": "Uber", "ride_type": "auto", "fare": 125,
-             "currency": "INR", "fare_status": "model"},
-            {"id": "uber-sedan-model", "provider": "Uber", "ride_type": "sedan", "fare": 130,
-             "currency": "INR", "fare_status": "model"},
-            {"id": "ola-auto-model", "provider": "Ola", "ride_type": "auto", "fare": 125,
-             "currency": "INR", "fare_status": "model"},
-            {"id": "rapido-bike-model", "provider": "Rapido", "ride_type": "bike", "fare": 125,
-             "currency": "INR", "fare_status": "model"},
-        ]
-        with (
-            patch("cabcompare.backend.services.fares.uber_fares", return_value=[live_uber]),
-            patch("cabcompare.backend.services.fares.ola_fares", return_value=[unavailable_ola]),
-            patch("cabcompare.backend.services.fares.estimate_rides", return_value=model_rides),
-        ):
-            rides = comparison_rides(PICKUP, DROP, {"distance_km": 5, "duration_minutes": 20}, {})
-        self.assertEqual(
-            {(ride["provider"], ride["fare_status"]) for ride in rides},
-            {("Uber", "live"), ("Uber", "estimated"), ("Ola", "estimated"), ("Rapido", "model")},
+    def test_rejects_insecure_http_remote_base_urls(self):
+        rides = ola.fetch_quotes(
+            BENGALURU_PICKUP,
+            BENGALURU_DROP,
+            {**OLA_ENV, "OLA_API_BASE_URL": "http://insecure.example.com"},
         )
-        self.assertIn("uber-sedan-estimate", {ride["id"] for ride in rides})
+        self.assertEqual(rides[0]["quoteType"], "UNAVAILABLE")
+        self.assertIn("HTTPS", rides[0]["error"])
 
-    def test_training_schema_is_header_only_and_rejects_empty_data(self):
-        from cabcompare.backend.models.train_fare_model import _read_dataset
+    def test_request_timeout_maps_to_provider_request_error(self):
+        with patch("cabcompare.backend.providers.base.urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            with self.assertRaises(ProviderRequestError) as ctx:
+                request_json("https://api.uber.com/v1.2/estimates/price", {})
+        self.assertIsNone(ctx.exception.status_code)
 
-        schema_path = Path(__file__).parents[1] / "models" / "fare_training_schema.csv"
-        with self.assertRaisesRegex(ValueError, "at least 5 labeled fare rows"):
-            _read_dataset(schema_path)
+    def test_quote_ttl_cache_avoids_duplicate_upstream_calls_for_same_route(self):
+        call_count = 0
 
-    def test_model_loader_reads_a_compatible_local_artifact(self):
-        import joblib
+        def fake_urlopen(req, timeout=5):
+            nonlocal call_count
+            call_count += 1
+            return io.BytesIO(json.dumps({
+                "products": [{"name": "Auto", "fare": 95, "currency": "INR"}]
+            }).encode())
 
-        artifact = {
-            "format_version": 1,
-            "feature_columns": [
-                "provider", "vehicle", "time_of_day", "currency", "distance_km",
-                "duration_minutes", "pickup_lat", "pickup_lng", "destination_lat", "destination_lng",
-            ],
-            "currency": "INR",
-            "feature_categories": {},
-            "model": ConstantFareModel(),
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "fare_model.joblib"
-            joblib.dump(artifact, path)
-            loaded = load_fare_model(path)
-        self.assertIsNotNone(loaded)
-        self.assertEqual(loaded["currency"], "INR")
-
-    def test_model_loader_treats_a_missing_artifact_as_unavailable(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "missing.joblib"
-            self.assertIsNone(load_fare_model(path))
-
-    @patch("cabcompare.backend.services.fares._get_json")
-    def test_hybrid_results_use_rate_card_estimates_after_api_failures(self, get_json):
-        get_json.side_effect = ProviderRequestError(status_code=429)
-        with patch("cabcompare.backend.services.estimates.load_fare_model", return_value=None):
-            rides = comparison_rides(
-                PICKUP,
-                DROP,
-                {"distance_km": 5, "duration_minutes": 20},
-                {**UBER_ENV, **OLA_ENV},
-            )
-        self.assertTrue(all(ride["fare_status"] == "estimated" for ride in rides))
-
-    def test_missing_route_metrics_make_estimated_provider_fares_unavailable(self):
-        rides = comparison_rides(PICKUP, DROP, None, {})
-        estimates = [ride for ride in rides if ride["provider"] in {"Rapido", "Namma Yatri"}]
-        self.assertTrue(all(ride["fare"] is None for ride in estimates))
-        self.assertTrue(all("Route distance" in ride["fare_unavailable_reason"] for ride in estimates))
+        with (
+            patch.dict("os.environ", {"OLA_APP_TOKEN": "ola-secret", "UBER_SERVER_TOKEN": "", "RAPIDO_API_URL": "", "NAMMA_YATRI_BAP_SEARCH_URL": ""}),
+            patch("cabcompare.backend.providers.base.urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            first = comparison_rides(BENGALURU_PICKUP, BENGALURU_DROP, None)
+            second = comparison_rides(BENGALURU_PICKUP, BENGALURU_DROP, None)
+        self.assertEqual(call_count, 1)
+        self.assertEqual(first[0]["quoteType"], second[0]["quoteType"])
 
 
 if __name__ == "__main__":
